@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::password;
+use crate::random::generate_opaque_token;
 use crate::store::{StoreError, UserStore};
 use crate::user::NewUser;
 
@@ -74,6 +75,7 @@ pub async fn register_handler(
 
     match store
         .create_user(NewUser {
+            user_id: generate_opaque_token(16),
             email,
             password_hash,
         })

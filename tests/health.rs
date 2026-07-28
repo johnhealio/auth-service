@@ -6,8 +6,8 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn healthz_returns_200() {
-    let store = common::test_store().await;
-    let app = auth_service::app(store);
+    let state = common::test_app_state().await;
+    let app = auth_service::app(state);
 
     let response = app
         .oneshot(

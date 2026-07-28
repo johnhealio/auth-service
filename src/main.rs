@@ -4,8 +4,10 @@ use firestore::{FirestoreDb, FirestoreDbOptions};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
-use auth_service::store::UserStore;
-use auth_service::store::firestore::FirestoreUserStore;
+use auth_service::AppState;
+use auth_service::store::firestore::{FirestoreRefreshTokenStore, FirestoreUserStore};
+use auth_service::store::{RefreshTokenStore, UserStore};
+use auth_service::token::JwtKeys;
 
 #[tokio::main]
 async fn main() {
@@ -25,7 +27,15 @@ async fn main() {
         .await
         .expect("failed to connect to Firestore");
 
-    let store: Arc<dyn UserStore> = Arc::new(FirestoreUserStore::new(db));
+    let store: Arc<dyn UserStore> = Arc::new(FirestoreUserStore::new(db.clone()));
+    let refresh_store: Arc<dyn RefreshTokenStore> = Arc::new(FirestoreRefreshTokenStore::new(db));
+    let jwt = Arc::new(JwtKeys::from_env());
+
+    let state = AppState {
+        store,
+        refresh_store,
+        jwt,
+    };
 
     let addr = "0.0.0.0:8080";
     let listener = TcpListener::bind(addr)
@@ -33,7 +43,7 @@ async fn main() {
         .expect("failed to bind address");
     tracing::info!(%addr, "auth-service listening");
 
-    axum::serve(listener, auth_service::app(store))
+    axum::serve(listener, auth_service::app(state))
         .await
         .expect("server error");
 }

@@ -33,8 +33,12 @@ separate decisions made in sequence.
   emulator; this sandbox has no Java to run it
 
 ## Status
-Modules 1–3 complete (tag `v0.1.0` covers Modules 1–2; Module 3 not yet
-tagged). Next: Module 4, login + token issuance.
+Modules 1–4 complete (tags `v0.1.0` = Modules 1–2, `v0.2.0` = Module 3;
+Module 4 not yet tagged). Module 4 absorbed the original Module 5 scope
+("protected route middleware, bearer-only, pre-DPoP") — `GET /me` and the
+`AuthUser` bearer extractor were built now rather than deferred, since
+they're the only way to prove login's issued token actually authenticates a
+follow-up request over real HTTP. Next: Module 6, DPoP proof validation.
 
 ## Decisions made so far
 
@@ -122,6 +126,55 @@ no transaction needed. Tradeoff: email is effectively the primary key;
 changing it later means creating a new doc, not an in-place update —
 accepted for this project.
 
+### Module 4: Access-token TTL — 10 minutes
+No revocation path exists for access tokens until DPoP (Module 6, raises the
+bar for *using* a stolen token, doesn't revoke it) and refresh rotation
+(Module 7, only protects the refresh token). TTL is the only current lever
+against leaked-token exposure, so leaning toward the short end of Module 1's
+original "5–15 min" target. `token::ACCESS_TOKEN_TTL`, hardcoded like the
+Argon2 params — fixed security policy, not deployment config.
+
+### Module 4: JWT `sub` claim — opaque `user_id`, not email
+Added a `user_id` field to `User` (Module 3's schema), generated at
+registration via `random::generate_opaque_token(16)`, used as the JWT `sub`.
+Using email as `sub` would have quietly contradicted Module 1's "no PII in
+the JWT" decision — email is PII. The Firestore doc ID for `users` stays the
+normalized email (Module 3's atomic-uniqueness design is unaffected);
+`user_id` is just an added field, used only as the JWT identity.
+
+### Module 4: JWT signing — HS256, secret via required env var
+HS256 chosen over RS256/ES256: this service both issues and verifies its own
+tokens, and nothing on the roadmap (including Cloud Run horizontal scaling in
+Module 8, which is same-service replicas, not a split issuer/verifier)
+introduces an independent verifier that would benefit from asymmetric
+signing. Signing secret comes from a required `JWT_SIGNING_SECRET` env var
+(`token::JwtKeys::from_env()`), mirroring the existing `FIRESTORE_PROJECT_ID`
+convention — generate with `openssl rand -hex 32`, never committed. Tradeoff:
+restarting without re-exporting the same value invalidates prior tokens —
+acceptable for dev; Module 8/10 replace this with Secret Manager.
+Dependency note: `jsonwebtoken` needed the `rust_crypto` feature enabled to
+get any signing backend at all (no crypto provider is on by default).
+
+### Module 4: Refresh tokens — hashed at rest, 30-day TTL
+Refresh tokens are stored as their SHA-256 hash, not plaintext — the hash
+itself is the Firestore doc ID in a new `refresh_tokens` collection (mirrors
+Module 3's "email as doc ID" pattern: content-addressed, atomic lookup, no
+separate compare step). Unlike passwords, refresh tokens are already
+random/high-entropy, so a fast hash is sufficient — no dictionary-attack
+surface, and hashing protects against a Firestore read/backup leak turning
+into immediately-usable bearer credentials. 30-day TTL, checked at
+redemption time (not yet a Firestore TTL policy — Module 4 doesn't implement
+`/refresh` redemption itself, that's Module 7's rotation work).
+
+### Module 4: Timing-safe login
+An unknown email used to short-circuit before Argon2 ran, while a wrong
+password against a real email paid ~20–40ms — an observable,
+account-existence-leaking timing gap even with identical error text.
+Fixed by verifying against a precomputed dummy Argon2 hash
+(`login::DUMMY_HASH`) when the user doesn't exist, so both paths pay the
+same cost. Tested by asserting the wrong-password and unknown-email
+responses are field-for-field identical, not just "also generic."
+
 ## Constraints
 - No secrets or credentials ever committed to the repo or written into code.
 - Firestore access from the deployed service should use a dedicated service
@@ -134,6 +187,6 @@ accepted for this project.
 - Test: `cargo test`
 - Lint: `cargo clippy`
 - Format: `cargo fmt`
-- Run locally: `FIRESTORE_PROJECT_ID=johnhealio-claude-code FIRESTORE_DATABASE_ID=auth-service-dev cargo run`
-  (same env vars needed for `cargo test`, since tests run against the real
-  dev Firestore database — see Module 3 decisions)
+- Run locally: `FIRESTORE_PROJECT_ID=johnhealio-claude-code FIRESTORE_DATABASE_ID=auth-service-dev JWT_SIGNING_SECRET=$(openssl rand -hex 32) cargo run`
+  (`cargo test` only needs the two `FIRESTORE_*` vars — tests use a fixed
+  test-only signing secret, see `tests/common/mod.rs`)
