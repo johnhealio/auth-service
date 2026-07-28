@@ -34,15 +34,20 @@ separate decisions made in sequence.
   emulator; this sandbox has no Java to run it
 
 ## Status
-Modules 1–7 complete (tags `v0.1.0` = Modules 1–2, `v0.2.0` = Module 3,
-`v0.3.0` = Module 4, `v0.4.0` = Module 6; Module 7 not yet tagged). Module 4
-absorbed the original Module 5 scope ("protected route middleware,
-bearer-only, pre-DPoP") — `GET /me` and the `AuthUser` bearer extractor were
-built then rather than deferred. Module 6 (DPoP proof-of-possession) made
-DPoP mandatory at login and on `/me`. Module 7 (DPoP-bound refresh rotation)
-is done — `POST /refresh` now enforces the `jkt` binding stored since
-Module 6, rotates on every use, and detects/revokes reused tokens. This was
-the last module with a roadmap-flagged pause point. Next: Module 8,
+Modules 1–8 complete (tags `v0.1.0` = Modules 1–2, `v0.2.0` = Module 3,
+`v0.3.0` = Module 4, `v0.4.0` = Module 6, `v0.5.0` = Module 7; Module 8 not
+yet tagged/deployed). Module 4 absorbed the original Module 5 scope
+("protected route middleware, bearer-only, pre-DPoP") — `GET /me` and the
+`AuthUser` bearer extractor were built then rather than deferred. Module 6
+(DPoP proof-of-possession) made DPoP mandatory at login and on `/me`.
+Module 7 (DPoP-bound refresh rotation) enforced the `jkt` binding stored
+since Module 6, rotating on every use and detecting/revoking reused tokens
+— the last module with a roadmap-flagged pause point. Module 8 (Terraform
++ Cloud Run) provides the Dockerfile and `terraform/production/` IaC; the
+actual build/push/apply happens from the user's laptop (this sandbox has
+no Docker and its VM identity has no IAM permissions), so deployment
+itself is not yet done as of this commit. Next: Module 9 (local dev
+polish) or Module 10 (hardening pass).
 Terraform IaC + Cloud Run deployment.
 
 ## Decisions made so far
@@ -294,6 +299,85 @@ rejected-but-untouched attempt, not a theft signal: the opaque token secret
 was presented correctly, only the proof-of-possession key differs, more
 plausibly a client bug than evidence of token theft. Doesn't trigger family
 revocation.
+
+### Module 8: Same GCP project as dev, isolated via database + service account, not a second project
+Production lives in `johnhealio-claude-code` (the same project as dev),
+isolated via a separate Firestore database (`auth-service-prod`), a
+dedicated least-privilege service account, a database-scoped IAM
+condition, and a separate Terraform root/state (`terraform/production/`,
+independent of `terraform/dev-bootstrap/`). Gets most of the practical
+blast-radius reduction of a separate project without new
+project/billing/cross-project-IAM overhead — right-sized for a solo
+learning project with no live users yet. The counter-case (a separate
+project is a hard trust boundary a same-project IAM misconfiguration can't
+cross) is real but not proportionate here.
+
+### Module 8: Firestore IAM least-privilege scoping (roadmap's flagged pause point, resolved)
+`roles/datastore.user` (entity CRUD only — excludes the database
+create/delete permissions dev-bootstrap's VM identity needs but this
+deployed service doesn't), bound with an IAM condition restricting it to
+the production database specifically
+(`resource.name == "projects/{project}/databases/{prod-database-id}"`).
+Collection-level IAM scoping doesn't exist for Firestore — the IAM
+resource hierarchy stops at the database. Firestore Security Rules can
+scope to collections/documents, but aren't enforced for server-side
+service-account/gRPC access (only Firebase client-SDK access with
+end-user auth) — which is how this app talks to Firestore, so Security
+Rules don't apply here. Database-scoped IAM conditioning is the finest
+grain actually available, and a real improvement over dev-bootstrap's
+project-wide `datastore.owner`.
+
+### Module 8: `firestore` crate — `tls-webpki-roots`, not the default `tls-roots`
+`firestore = { default-features = false, features = ["tls-webpki-roots"] }`
+removes `native-tls`/OpenSSL from the dependency tree entirely (confirmed
+via `Cargo.lock` — the OpenSSL dependency came from `firestore`'s default
+feature via `gcloud-sdk`, not from this project's own `reqwest` usage,
+which was already rustls by default). One pure-Rust crypto stack across
+the whole binary now (rustls + RustCrypto, matching `jsonwebtoken`'s
+`rust_crypto` feature and `argon2` per Module 6's precedent). Note:
+`ca-certificates` *files* are still needed in the runtime container
+regardless — `rustls-platform-verifier` reads the OS CA bundle from disk
+for the HIBP HTTPS call; the Firestore gRPC channel is unaffected, since
+`tls-webpki-roots` compiles a root bundle directly into the binary.
+
+### Module 8: Secret Manager + Cloud Run's own URL both need a phased apply
+`JWT_SIGNING_SECRET` is sourced from Secret Manager (`value_source.secret_key_ref`,
+`version = "latest"`), and the service account gets `roles/secretmanager.secretAccessor`
+scoped to just that one secret — but Terraform only ever creates the empty
+secret *container*; the value is populated out-of-band via `gcloud secrets
+versions add` (never a literal in code/state, per the no-secrets-committed
+constraint). Separately, `PUBLIC_BASE_URL` (needed for DPoP `htu`
+validation) has to be the Cloud Run service's own assigned URL, which
+isn't known until after Cloud Run creates the service — a real circular
+dependency. Both are resolved the same way: apply once (secret container /
+Cloud Run with a placeholder URL), populate/observe out-of-band, apply
+again. See `terraform/production/README.md` for the exact sequence — not
+a single `terraform apply`.
+
+### Module 8: Cloud Run concurrency capped at 10, min instances = 0
+`max_instance_request_concurrency = 10` (down from Cloud Run's default 80)
+directly from the existing Argon2-memory-pressure reasoning (`m_cost ×
+concurrency`, Module 3) — 80 concurrent requests would mean ~1.5 GiB of
+Argon2 pressure alone on one instance, with no rate limiting yet (Module
+10) to bound it otherwise. `min_instance_count = 0` (scale-to-zero,
+confirmed with the user): near-zero cost while idle, cold-start penalty
+softened by Rust/Axum's fast startup vs. most other stacks. `cpu = "1"`,
+`memory = "512Mi"`, `max_instance_count = 3` (bounded, not unlimited, to
+cap runaway-scaling cost). `us-central1`, matching Firestore's region.
+
+### Module 8: Manual image build/push, not Cloud Build; debian-slim runtime image
+Neither Claude nor this sandbox can build/push a Docker image or run
+`terraform apply` (no Docker here; the VM's service account has zero IAM
+permissions on the project) — the user does both from their laptop, same
+pattern as `terraform/dev-bootstrap/`. Deferred Cloud Build/CI automation
+to a later module rather than adding its IAM/Terraform surface now for no
+benefit on this module specifically. Runtime container is
+`debian:bookworm-slim` + `ca-certificates`, not distroless, for this first
+deployment — debuggable (shell, `curl`) if the first rollout breaks;
+~60-80MB vs. distroless's ~20MB doesn't matter for this project's
+cost/cold-start profile. Public invoker access (`allUsers`) is
+intentional — this is an auth service, registration/login must be
+reachable without pre-existing credentials.
 
 ## Constraints
 - No secrets or credentials ever committed to the repo or written into code.

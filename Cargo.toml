@@ -1,6 +1,6 @@
 [package]
 name = "auth-service"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 
 [dependencies]
@@ -9,7 +9,7 @@ async-trait = "0.1.91"
 axum = "0.8.9"
 base64 = "0.23.0"
 chrono = { version = "0.4.45", features = ["serde"] }
-firestore = { version = "0.50.0", features = ["default"] }
+firestore = { version = "0.50.0", default-features = false, features = ["tls-webpki-roots"] }
 jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 reqwest = { version = "0.13.4", features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }

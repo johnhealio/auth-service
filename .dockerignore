@@ -1,0 +1,11 @@
+/target
+.git
+.gitignore
+terraform/
+*.tfstate
+*.tfstate.*
+.terraform/
+*.txt
+.claude/
+README.md
+CLAUDE.md
