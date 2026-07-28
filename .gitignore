@@ -1,1 +1,9 @@
 /target
+
+# Terraform local state and cache — may contain resource details, never committed
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
