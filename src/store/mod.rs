@@ -1,6 +1,7 @@
 use std::fmt;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 use crate::refresh_token::{NewRefreshToken, RefreshTokenRecord};
 use crate::user::{NewUser, User};
@@ -10,6 +11,8 @@ pub mod firestore;
 #[derive(Debug)]
 pub enum StoreError {
     DuplicateEmail,
+    /// A DPoP proof `jti` that's already been seen — the proof is a replay.
+    Replayed,
     Backend(String),
 }
 
@@ -17,6 +20,7 @@ impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StoreError::DuplicateEmail => write!(f, "email already registered"),
+            StoreError::Replayed => write!(f, "DPoP proof jti already used"),
             StoreError::Backend(message) => write!(f, "backend error: {message}"),
         }
     }
@@ -48,4 +52,13 @@ pub trait RefreshTokenStore: Send + Sync {
         &self,
         token_hash: &str,
     ) -> Result<Option<RefreshTokenRecord>, StoreError>;
+}
+
+#[async_trait]
+pub trait DpopReplayStore: Send + Sync {
+    /// Atomically records a DPoP proof's `jti` as seen. Returns
+    /// `StoreError::Replayed` if this `jti` was already recorded — an
+    /// insert-if-absent check, not a find-then-insert, to avoid a TOCTOU
+    /// race under concurrent requests.
+    async fn insert_jti(&self, jti: &str, expires_at: DateTime<Utc>) -> Result<(), StoreError>;
 }

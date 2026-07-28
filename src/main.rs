@@ -5,8 +5,11 @@ use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 use auth_service::AppState;
-use auth_service::store::firestore::{FirestoreRefreshTokenStore, FirestoreUserStore};
-use auth_service::store::{RefreshTokenStore, UserStore};
+use auth_service::dpop::PublicBaseUrl;
+use auth_service::store::firestore::{
+    FirestoreDpopReplayStore, FirestoreRefreshTokenStore, FirestoreUserStore,
+};
+use auth_service::store::{DpopReplayStore, RefreshTokenStore, UserStore};
 use auth_service::token::JwtKeys;
 
 #[tokio::main]
@@ -28,13 +31,18 @@ async fn main() {
         .expect("failed to connect to Firestore");
 
     let store: Arc<dyn UserStore> = Arc::new(FirestoreUserStore::new(db.clone()));
-    let refresh_store: Arc<dyn RefreshTokenStore> = Arc::new(FirestoreRefreshTokenStore::new(db));
+    let refresh_store: Arc<dyn RefreshTokenStore> =
+        Arc::new(FirestoreRefreshTokenStore::new(db.clone()));
+    let dpop_replay: Arc<dyn DpopReplayStore> = Arc::new(FirestoreDpopReplayStore::new(db));
     let jwt = Arc::new(JwtKeys::from_env());
+    let public_base_url = PublicBaseUrl::from_env();
 
     let state = AppState {
         store,
         refresh_store,
+        dpop_replay,
         jwt,
+        public_base_url,
     };
 
     let addr = "0.0.0.0:8080";

@@ -102,6 +102,17 @@ pub async fn register_handler(
                 "failed to process registration",
             )
         }
+        Err(StoreError::Replayed) => {
+            // Not a real code path for user creation — a UserStore never
+            // returns this variant — but StoreError is shared across store
+            // traits, so match exhaustively rather than panic if it ever did.
+            tracing::error!("unexpected StoreError::Replayed from create_user");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "failed to process registration",
+            )
+        }
     }
 }
 

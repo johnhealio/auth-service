@@ -2,15 +2,16 @@ use std::sync::{Arc, LazyLock};
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::dpop::{self, DpopError, PublicBaseUrl};
 use crate::password;
 use crate::random::{generate_opaque_token, hash_token};
 use crate::refresh_token::NewRefreshToken;
-use crate::store::{RefreshTokenStore, UserStore};
+use crate::store::{DpopReplayStore, RefreshTokenStore, UserStore};
 use crate::token::JwtKeys;
 
 // Paid on every login where the account doesn't exist, so that path costs
@@ -38,10 +39,16 @@ pub struct LoginResponse {
     pub refresh_token: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn login_handler(
     State(store): State<Arc<dyn UserStore>>,
     State(refresh_store): State<Arc<dyn RefreshTokenStore>>,
+    State(dpop_replay): State<Arc<dyn DpopReplayStore>>,
     State(jwt): State<Arc<JwtKeys>>,
+    State(base_url): State<PublicBaseUrl>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> Response {
     let email = request.email.trim().to_lowercase();
@@ -75,7 +82,29 @@ pub async fn login_handler(
         );
     };
 
-    let (access_token, _claims) = match jwt.issue_access_token(&user.user_id) {
+    // Validated only after credentials succeed: a bad DPoP proof on a
+    // doomed-anyway login attempt shouldn't get a different error path or
+    // add a timing signal distinguishing "bad password" from "bad proof."
+    let dpop_header = match headers.get("DPoP").and_then(|value| value.to_str().ok()) {
+        Some(header) => header,
+        None => return dpop_error_response(StatusCode::BAD_REQUEST, &DpopError::Missing),
+    };
+
+    let proof = match dpop::validate_dpop_proof(
+        dpop_header,
+        &method,
+        &base_url,
+        uri.path(),
+        None,
+        dpop_replay.as_ref(),
+    )
+    .await
+    {
+        Ok(proof) => proof,
+        Err(err) => return dpop_error_response(StatusCode::BAD_REQUEST, &err),
+    };
+
+    let (access_token, _claims) = match jwt.issue_access_token(&user.user_id, &proof.jkt) {
         Ok(result) => result,
         Err(err) => {
             tracing::error!(error = %err, "failed to issue access token");
@@ -90,6 +119,7 @@ pub async fn login_handler(
         .create(
             NewRefreshToken {
                 user_email: user.email.clone(),
+                jkt: proof.jkt.clone(),
             },
             &token_hash,
         )
@@ -118,4 +148,8 @@ fn internal_error() -> Response {
 
 fn error_response(status: StatusCode, error: &str, message: &str) -> Response {
     (status, Json(json!({ "error": error, "message": message }))).into_response()
+}
+
+fn dpop_error_response(status: StatusCode, err: &DpopError) -> Response {
+    error_response(status, "invalid_dpop_proof", err.message())
 }

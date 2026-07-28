@@ -23,7 +23,8 @@ separate decisions made in sequence.
 - Web framework: Axum (decided in Module 1)
 - Database: Firestore (via the `firestore` crate, fluent API, v0.12+)
 - Auth model: minimal-claims JWT access tokens + DPoP-bound opaque refresh
-  tokens (decided in Module 1). See Decisions below for rationale.
+  tokens (decided in Module 1). DPoP (RFC 9449) is mandatory as of Module 6 —
+  see Decisions below for rationale.
 - Client type: backend/CLI and native app client
 - Password hashing: Argon2id, `m_cost=19456` KiB / `t_cost=2` / `p_cost=1`
   (decided in Module 3, see Decisions below)
@@ -33,12 +34,13 @@ separate decisions made in sequence.
   emulator; this sandbox has no Java to run it
 
 ## Status
-Modules 1–4 complete (tags `v0.1.0` = Modules 1–2, `v0.2.0` = Module 3;
-Module 4 not yet tagged). Module 4 absorbed the original Module 5 scope
-("protected route middleware, bearer-only, pre-DPoP") — `GET /me` and the
-`AuthUser` bearer extractor were built now rather than deferred, since
-they're the only way to prove login's issued token actually authenticates a
-follow-up request over real HTTP. Next: Module 6, DPoP proof validation.
+Modules 1–6 complete (tags `v0.1.0` = Modules 1–2, `v0.2.0` = Module 3,
+`v0.3.0` = Module 4; Module 6 not yet tagged). Module 4 absorbed the
+original Module 5 scope ("protected route middleware, bearer-only,
+pre-DPoP") — `GET /me` and the `AuthUser` bearer extractor were built then
+rather than deferred. Module 6 (DPoP proof-of-possession) is done — DPoP is
+now mandatory at login and on `/me`. Next: Module 7, DPoP-bound refresh
+token rotation.
 
 ## Decisions made so far
 
@@ -175,6 +177,67 @@ Fixed by verifying against a precomputed dummy Argon2 hash
 same cost. Tested by asserting the wrong-password and unknown-email
 responses are field-for-field identical, not just "also generic."
 
+### Module 6: DPoP mandatory, not optional
+Enforced at both login and on `/me`. An optional bearer-only fallback would
+let an attacker just omit the `DPoP` header and use a stolen token exactly
+as before, defeating the point of Module 1's whole DPoP-bound design. Broke
+the existing login/`/me` tests in the expected way (they now need a valid
+proof); no bearer-only path exists anywhere in the app.
+
+### Module 6: `htu` validated against a required `PUBLIC_BASE_URL`
+Not derived from request headers. This codebase has no forwarded-header
+trust logic, and Cloud Run terminates TLS at the front end, so a request's
+own view of its scheme is unreliable in production. Expected `htu` =
+`PUBLIC_BASE_URL` + the request path; comparison normalizes scheme/host
+case and default-port omission (via the `url` crate), exact path match, no
+trailing-slash leniency added speculatively.
+
+### Module 6: Freshness — 300s replay window, ±60s clock skew
+±60s skew is the conventional OAuth/OIDC default (matches `jsonwebtoken`'s
+own `Validation::leeway`). 300s window balances a small/cheap `jti` replay
+cache against not spuriously rejecting slow/retried legitimate requests —
+the cache only needs to remember entries for `window + skew` (~6 min),
+since staler proofs are already rejected on `iat` freshness alone.
+Firestore collection `dpop_jti`, doc ID = the `jti` itself (not hashed —
+it's a server-mandated-unique client nonce, not a secret); insert-if-absent
+via the same `DataConflictError` pattern used for email/refresh-token
+uniqueness, so replay detection is atomic with no transaction needed.
+
+### Module 6: DPoP-Nonce (RFC 9449's optional server-challenge) — deferred
+Defends against *offline pre-generation* of proofs (e.g. from a transient
+client key compromise) by forcing every proof to be minted after a live
+round-trip with the server — not against real-time interception, which is
+TLS's job. That threat is narrow and sophisticated for a project with no
+adversarial production traffic yet; the added complexity (extra round trip,
+nonce state/rotation, more test surface) isn't proportional to the learning
+value here. Fully additive later — doesn't foreclose adding it. Documented
+as future work, not implemented.
+
+### Module 6: DPoP proof signature — ES256 only
+The RFC's cited example algorithm, most interoperable for future
+spec-compliance testing, and keeps verification to one `Validation` config
+with no algorithm-confusion surface. `alg: none` and symmetric algs
+(`HS*`) are rejected by construction — tested explicitly.
+
+### Module 6: `cnf.jkt` binding and `jkt` storage
+`JwtClaims.cnf` (RFC 7800/9449 §6.1's nested `{"jkt": "..."}` shape, not
+flattened) is non-optional, since DPoP is mandatory — every access token is
+key-bound from issuance. `RefreshTokenRecord` also gets a `jkt` field now
+(storage only, no enforcement — that's Module 7's redemption/rotation
+logic), written from the same thumbprint bound into the access token at
+login. Avoids a schema migration or permanently-unbound early tokens later.
+
+### Module 6: `DpopBoundUser` composes `AuthUser`, doesn't replace it
+`AuthUser` (Module 4, bearer-JWT-only) stays available in isolation for
+anything that might not need DPoP later. `DpopBoundUser` (used by `/me`)
+re-verifies the bearer JWT itself plus the accompanying `DPoP` proof: the
+proof's `ath` must hash-match the actual bearer token, and its key
+thumbprint must equal the token's `cnf.jkt`. Implementation finding:
+`jsonwebtoken` 11 already has RFC 7638 thumbprint support built in
+(`Jwk::thumbprint`), embedded-JWK header support, and
+`DecodingKey::from_jwk` — no hand-rolled canonical-JSON thumbprint code
+needed.
+
 ## Constraints
 - No secrets or credentials ever committed to the repo or written into code.
 - Firestore access from the deployed service should use a dedicated service
@@ -187,6 +250,6 @@ responses are field-for-field identical, not just "also generic."
 - Test: `cargo test`
 - Lint: `cargo clippy`
 - Format: `cargo fmt`
-- Run locally: `FIRESTORE_PROJECT_ID=johnhealio-claude-code FIRESTORE_DATABASE_ID=auth-service-dev JWT_SIGNING_SECRET=$(openssl rand -hex 32) cargo run`
+- Run locally: `FIRESTORE_PROJECT_ID=johnhealio-claude-code FIRESTORE_DATABASE_ID=auth-service-dev JWT_SIGNING_SECRET=$(openssl rand -hex 32) PUBLIC_BASE_URL=http://localhost:8080 cargo run`
   (`cargo test` only needs the two `FIRESTORE_*` vars — tests use a fixed
-  test-only signing secret, see `tests/common/mod.rs`)
+  test-only signing secret and base URL, see `tests/common/mod.rs`)

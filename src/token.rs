@@ -12,14 +12,23 @@ use crate::random::generate_opaque_token;
 // Argon2-params precedent.
 pub const ACCESS_TOKEN_TTL: Duration = Duration::from_secs(10 * 60);
 
+/// RFC 7800/9449 §6.1 confirmation claim — nested per spec, not flattened.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfirmationClaim {
+    pub jkt: String,
+}
+
 /// Minimal claims per Module 1's decision: identity + expiry only, no
-/// PII/permissions. `sub` is the opaque `user_id`, not the email.
+/// PII/permissions. `sub` is the opaque `user_id`, not the email. `cnf.jkt`
+/// (Module 6) is non-optional — DPoP is mandatory, so every access token is
+/// key-bound from the moment it's issued.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JwtClaims {
     pub sub: String,
     pub iat: i64,
     pub exp: i64,
     pub jti: String,
+    pub cnf: ConfirmationClaim,
 }
 
 /// Deliberately no `Debug`/`Clone` derive — holds signing key material.
@@ -54,9 +63,12 @@ impl JwtKeys {
         self.ttl
     }
 
+    /// `jkt` is the DPoP key thumbprint (RFC 7638) computed from the
+    /// client's proof at issuance — see `dpop::validate_dpop_proof`.
     pub fn issue_access_token(
         &self,
         user_id: &str,
+        jkt: &str,
     ) -> jsonwebtoken::errors::Result<(String, JwtClaims)> {
         let now = jsonwebtoken::get_current_timestamp() as i64;
         let claims = JwtClaims {
@@ -64,6 +76,9 @@ impl JwtKeys {
             iat: now,
             exp: now + self.ttl.as_secs() as i64,
             jti: generate_opaque_token(16),
+            cnf: ConfirmationClaim {
+                jkt: jkt.to_string(),
+            },
         };
         let token = encode(&Header::new(Algorithm::HS256), &claims, &self.encoding)?;
         Ok((token, claims))
@@ -91,18 +106,19 @@ mod tests {
     #[test]
     fn issue_and_verify_roundtrip() {
         let keys = test_keys();
-        let (token, issued_claims) = keys.issue_access_token("user-123").unwrap();
+        let (token, issued_claims) = keys.issue_access_token("user-123", "test-jkt").unwrap();
         let verified_claims = keys.verify_access_token(&token).unwrap();
 
         assert_eq!(verified_claims.sub, "user-123");
         assert_eq!(verified_claims.jti, issued_claims.jti);
         assert_eq!(verified_claims.exp - verified_claims.iat, 600);
+        assert_eq!(verified_claims.cnf.jkt, "test-jkt");
     }
 
     #[test]
     fn tampered_token_fails_verification() {
         let keys = test_keys();
-        let (token, _) = keys.issue_access_token("user-123").unwrap();
+        let (token, _) = keys.issue_access_token("user-123", "test-jkt").unwrap();
         let mut tampered = token.clone();
         tampered.push('x');
 
@@ -116,7 +132,7 @@ mod tests {
             b"a different signing secret, also 32+ bytes!",
             ACCESS_TOKEN_TTL,
         );
-        let (token, _) = keys_a.issue_access_token("user-123").unwrap();
+        let (token, _) = keys_a.issue_access_token("user-123", "test-jkt").unwrap();
 
         assert!(keys_b.verify_access_token(&token).is_err());
     }
@@ -124,8 +140,8 @@ mod tests {
     #[test]
     fn two_tokens_for_same_user_have_different_jti() {
         let keys = test_keys();
-        let (_, claims_a) = keys.issue_access_token("user-123").unwrap();
-        let (_, claims_b) = keys.issue_access_token("user-123").unwrap();
+        let (_, claims_a) = keys.issue_access_token("user-123", "test-jkt").unwrap();
+        let (_, claims_b) = keys.issue_access_token("user-123", "test-jkt").unwrap();
 
         assert_ne!(claims_a.jti, claims_b.jti);
     }
