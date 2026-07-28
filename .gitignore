@@ -1,5 +1,8 @@
 /target
 
+# Conversation exports from /export — not project source
+*.txt
+
 # Terraform local state and cache — may contain resource details, never committed
 **/.terraform/
 *.tfstate
