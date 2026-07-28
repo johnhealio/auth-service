@@ -192,9 +192,7 @@ pub async fn validate_dpop_proof(
         .map_err(|err| match err {
             StoreError::Replayed => DpopError::Replayed,
             StoreError::Backend(message) => DpopError::Backend(message),
-            StoreError::DuplicateEmail => {
-                DpopError::Backend("unexpected DuplicateEmail from replay store".to_string())
-            }
+            other => DpopError::Backend(format!("unexpected {other} from replay store")),
         })?;
 
     Ok(DpopProof {

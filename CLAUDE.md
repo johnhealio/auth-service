@@ -34,13 +34,16 @@ separate decisions made in sequence.
   emulator; this sandbox has no Java to run it
 
 ## Status
-Modules 1–6 complete (tags `v0.1.0` = Modules 1–2, `v0.2.0` = Module 3,
-`v0.3.0` = Module 4; Module 6 not yet tagged). Module 4 absorbed the
-original Module 5 scope ("protected route middleware, bearer-only,
-pre-DPoP") — `GET /me` and the `AuthUser` bearer extractor were built then
-rather than deferred. Module 6 (DPoP proof-of-possession) is done — DPoP is
-now mandatory at login and on `/me`. Next: Module 7, DPoP-bound refresh
-token rotation.
+Modules 1–7 complete (tags `v0.1.0` = Modules 1–2, `v0.2.0` = Module 3,
+`v0.3.0` = Module 4, `v0.4.0` = Module 6; Module 7 not yet tagged). Module 4
+absorbed the original Module 5 scope ("protected route middleware,
+bearer-only, pre-DPoP") — `GET /me` and the `AuthUser` bearer extractor were
+built then rather than deferred. Module 6 (DPoP proof-of-possession) made
+DPoP mandatory at login and on `/me`. Module 7 (DPoP-bound refresh rotation)
+is done — `POST /refresh` now enforces the `jkt` binding stored since
+Module 6, rotates on every use, and detects/revokes reused tokens. This was
+the last module with a roadmap-flagged pause point. Next: Module 8,
+Terraform IaC + Cloud Run deployment.
 
 ## Decisions made so far
 
@@ -237,6 +240,60 @@ thumbprint must equal the token's `cnf.jkt`. Implementation finding:
 (`Jwk::thumbprint`), embedded-JWK header support, and
 `DecodingKey::from_jwk` — no hand-rolled canonical-JSON thumbprint code
 needed.
+
+### Module 7: 90-day absolute session cap alongside sliding rotation
+Each rotation still gets a fresh 30-day `REFRESH_TOKEN_TTL_DAYS` window, but
+`RefreshTokenRecord.expires_at` is capped at `family_created_at + 90 days`
+(`ABSOLUTE_SESSION_CAP_DAYS`). Reuse detection is a *detective* control — it
+only fires when the legitimate holder and an attacker collide on presenting
+the same stale token. If the legitimate client never again presents a
+stolen-and-since-rotated-away token, there's no collision to detect, and
+pure sliding renewal would let a silent theft persist indefinitely. The cap
+bounds that worst case as defense-in-depth, consistent with this project's
+existing posture that TTL is a preventive lever, not just detection.
+
+### Module 7: `/refresh` distinguishes reuse from invalid/expired
+`not-found` and `expired` collapse into one generic `invalid_refresh_token`
+response; `reused` (family revoked) gets its own `refresh_token_reused`
+response, so a legitimate client can show "your session was reset for
+security reasons, please log in again" instead of a generic error. Specific
+cause is always logged server-side regardless of which response the client
+sees.
+
+### Module 7: Soft-delete via a `status` field, not hard-delete + ledger
+`RefreshTokenRecord` gained `status` (`Active | Rotated | Revoked`),
+`family_id`, `family_created_at`, `replaced_by`, and `token_hash` (a query
+result doesn't otherwise carry its own document ID, needed for
+`revoke_family`'s query-then-update flow). One record type, consistent with
+how `refresh_tokens`/`dpop_jti` already accept some unpurged growth as a
+deferred infra nicety, not a blocker.
+
+### Module 7: Rotation and family revocation run inside Firestore transactions, not the batch-write API
+Firestore write preconditions only support `Exists(bool)` — there's no way
+to express "only update if status == Active" as a precondition, so the
+atomic check-and-transition needs a real transaction, not the
+insert-collision trick used elsewhere in this codebase. `rotate()` is
+two-phase: a non-transactional pre-check (fast-path `NotFound`/`Expired`,
+and `Reused` if the token's already non-`Active`), then a small
+transaction re-reading the old record (handling the race where a
+concurrent rotation committed in between) that atomically marks the old
+record `Rotated` and creates the new `Active` one. `revoke_family` queries
+by `family_id` and flips every non-`Revoked` member inside its own
+transaction — not the batch-write API, since batch writes apply
+independently and a partial failure could leave a sibling token silently
+still valid.
+
+### Module 7: `/refresh` DPoP handling
+Reuses `dpop::validate_dpop_proof` unchanged (`ath: None`, same as login) —
+RFC 9449 §4.2/§7 only requires `ath` alongside a presented bearer *access*
+token, which a refresh redemption never has. Token lookup happens before
+DPoP validation, mirroring login's password-before-DPoP ordering. A `jkt`
+mismatch against the stored record — the first place `jkt` is actually
+*enforced*, not just stored (RFC 9449 §5) — is treated as a
+rejected-but-untouched attempt, not a theft signal: the opaque token secret
+was presented correctly, only the proof-of-possession key differs, more
+plausibly a client bug than evidence of token theft. Doesn't trigger family
+revocation.
 
 ## Constraints
 - No secrets or credentials ever committed to the repo or written into code.

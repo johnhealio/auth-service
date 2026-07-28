@@ -10,6 +10,7 @@ pub mod dpop;
 pub mod login;
 pub mod password;
 pub mod random;
+pub mod refresh;
 pub mod refresh_token;
 pub mod register;
 pub mod store;
@@ -68,6 +69,7 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/register", post(register::register_handler))
         .route("/login", post(login::login_handler))
+        .route("/refresh", post(refresh::refresh_handler))
         .route("/me", get(auth::me_handler))
         .with_state(state)
         .layer(TraceLayer::new_for_http())

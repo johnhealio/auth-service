@@ -31,8 +31,11 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+/// Shared by `/login` and `/refresh` — both hand back a fresh access +
+/// refresh token pair, just via different store operations internally
+/// (`create` establishes a new family, `rotate` continues one).
 #[derive(Debug, Serialize)]
-pub struct LoginResponse {
+pub struct TokenResponse {
     pub access_token: String,
     pub token_type: &'static str,
     pub expires_in: u64,
@@ -129,7 +132,7 @@ pub async fn login_handler(
         return internal_error();
     }
 
-    Json(LoginResponse {
+    Json(TokenResponse {
         access_token,
         token_type: "Bearer",
         expires_in: jwt.ttl().as_secs(),

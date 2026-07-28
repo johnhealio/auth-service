@@ -13,6 +13,15 @@ pub enum StoreError {
     DuplicateEmail,
     /// A DPoP proof `jti` that's already been seen — the proof is a replay.
     Replayed,
+    /// No record exists for the presented identifier (e.g. an unknown
+    /// refresh token).
+    NotFound,
+    /// The record exists but its TTL has passed.
+    Expired,
+    /// A refresh token that was already rotated away got presented again —
+    /// the reuse signal. The whole token family has been revoked as a
+    /// side effect of returning this variant.
+    Reused,
     Backend(String),
 }
 
@@ -21,6 +30,9 @@ impl fmt::Display for StoreError {
         match self {
             StoreError::DuplicateEmail => write!(f, "email already registered"),
             StoreError::Replayed => write!(f, "DPoP proof jti already used"),
+            StoreError::NotFound => write!(f, "record not found"),
+            StoreError::Expired => write!(f, "record expired"),
+            StoreError::Reused => write!(f, "refresh token reused; family revoked"),
             StoreError::Backend(message) => write!(f, "backend error: {message}"),
         }
     }
@@ -52,6 +64,23 @@ pub trait RefreshTokenStore: Send + Sync {
         &self,
         token_hash: &str,
     ) -> Result<Option<RefreshTokenRecord>, StoreError>;
+
+    /// Atomically exchanges `old_token_hash` for a new `Active` record
+    /// continuing the same family, marking the old one `Rotated`. If
+    /// `old_token_hash` isn't found: `StoreError::NotFound`. If found but
+    /// not `Active` (already rotated or revoked) — reuse — the whole
+    /// family is revoked as a side effect and `StoreError::Reused` is
+    /// returned. If found, `Active`, but past `expires_at`:
+    /// `StoreError::Expired` (not reuse — no revocation).
+    async fn rotate(
+        &self,
+        old_token_hash: &str,
+        new_token_hash: &str,
+        new_jkt: &str,
+    ) -> Result<RefreshTokenRecord, StoreError>;
+
+    /// Marks every non-`Revoked` record sharing `family_id` as `Revoked`.
+    async fn revoke_family(&self, family_id: &str) -> Result<(), StoreError>;
 }
 
 #[async_trait]

@@ -3,9 +3,14 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use ::firestore::FirestoreDb;
+use ::firestore::FirestoreWritePrecondition;
 use ::firestore::errors::FirestoreError;
 
-use crate::refresh_token::{NewRefreshToken, REFRESH_TOKEN_TTL_DAYS, RefreshTokenRecord};
+use crate::random::generate_opaque_token;
+use crate::refresh_token::{
+    ABSOLUTE_SESSION_CAP_DAYS, NewRefreshToken, REFRESH_TOKEN_TTL_DAYS, RefreshTokenRecord,
+    RefreshTokenStatus,
+};
 use crate::store::{DpopReplayStore, RefreshTokenStore, StoreError, UserStore};
 use crate::user::{NewUser, User};
 
@@ -59,6 +64,22 @@ impl UserStore for FirestoreUserStore {
     }
 }
 
+/// Outcome of a single rotation-transaction attempt. `NotActive` means the
+/// old record existed but wasn't `Active` by the time the transaction read
+/// it (either it was already rotated/revoked before we started, or a
+/// concurrent rotation won the race) — the caller (`rotate`) turns this
+/// into family revocation + `StoreError::Reused`, outside the transaction.
+enum RotateAttempt {
+    Rotated(RefreshTokenRecord),
+    NotActive,
+}
+
+fn capped_expiry(now: DateTime<Utc>, family_created_at: DateTime<Utc>) -> DateTime<Utc> {
+    let sliding = now + Duration::days(REFRESH_TOKEN_TTL_DAYS);
+    let absolute_cap = family_created_at + Duration::days(ABSOLUTE_SESSION_CAP_DAYS);
+    sliding.min(absolute_cap)
+}
+
 /// Separate struct from `FirestoreUserStore` to keep single-responsibility;
 /// `FirestoreDb` is cheap to clone (an internal connection handle), so
 /// callers share one connection across both stores.
@@ -81,10 +102,15 @@ impl RefreshTokenStore for FirestoreRefreshTokenStore {
     ) -> Result<RefreshTokenRecord, StoreError> {
         let now = Utc::now();
         let record = RefreshTokenRecord {
+            token_hash: token_hash.to_string(),
             user_email: new_token.user_email,
             jkt: new_token.jkt,
+            family_id: generate_opaque_token(16),
+            status: RefreshTokenStatus::Active,
+            replaced_by: None,
             created_at: now,
-            expires_at: now + Duration::days(REFRESH_TOKEN_TTL_DAYS),
+            expires_at: capped_expiry(now, now),
+            family_created_at: now,
         };
 
         self.db
@@ -108,6 +134,149 @@ impl RefreshTokenStore for FirestoreRefreshTokenStore {
             .by_id_in(REFRESH_TOKENS_COLLECTION)
             .obj::<RefreshTokenRecord>()
             .one(token_hash)
+            .await
+            .map_err(|err| StoreError::Backend(err.to_string()))
+    }
+
+    async fn rotate(
+        &self,
+        old_token_hash: &str,
+        new_token_hash: &str,
+        new_jkt: &str,
+    ) -> Result<RefreshTokenRecord, StoreError> {
+        // Non-transactional pre-check: fast-path NotFound/Expired/Reused
+        // without paying for a transaction when nothing needs to race.
+        let old = self
+            .find_by_hash(old_token_hash)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+
+        if old.status != RefreshTokenStatus::Active {
+            self.revoke_family(&old.family_id).await?;
+            return Err(StoreError::Reused);
+        }
+        if old.expires_at < Utc::now() {
+            return Err(StoreError::Expired);
+        }
+
+        let family_id = old.family_id.clone();
+        let family_id_for_closure = family_id.clone();
+        let family_created_at = old.family_created_at;
+        let user_email = old.user_email.clone();
+        let old_hash = old_token_hash.to_string();
+        let new_hash = new_token_hash.to_string();
+        let new_jkt = new_jkt.to_string();
+
+        let outcome = self
+            .db
+            .run_transaction(move |tx_db, tx| {
+                let family_id = family_id_for_closure.clone();
+                let user_email = user_email.clone();
+                let old_hash = old_hash.clone();
+                let new_hash = new_hash.clone();
+                let new_jkt = new_jkt.clone();
+                Box::pin(async move {
+                    let current = tx_db
+                        .fluent()
+                        .select()
+                        .by_id_in(REFRESH_TOKENS_COLLECTION)
+                        .obj::<RefreshTokenRecord>()
+                        .one(&old_hash)
+                        .await?;
+
+                    let Some(current) = current else {
+                        return Ok(RotateAttempt::NotActive);
+                    };
+                    if current.status != RefreshTokenStatus::Active {
+                        return Ok(RotateAttempt::NotActive);
+                    }
+
+                    let mut rotated_old = current;
+                    rotated_old.status = RefreshTokenStatus::Rotated;
+                    rotated_old.replaced_by = Some(new_hash.clone());
+
+                    let now = Utc::now();
+                    let new_record = RefreshTokenRecord {
+                        token_hash: new_hash.clone(),
+                        user_email,
+                        jkt: new_jkt,
+                        family_id,
+                        status: RefreshTokenStatus::Active,
+                        replaced_by: None,
+                        created_at: now,
+                        expires_at: capped_expiry(now, family_created_at),
+                        family_created_at,
+                    };
+
+                    tx_db
+                        .fluent()
+                        .update()
+                        .in_col(REFRESH_TOKENS_COLLECTION)
+                        .precondition(FirestoreWritePrecondition::Exists(true))
+                        .document_id(&old_hash)
+                        .object(&rotated_old)
+                        .add_to_transaction(tx)?;
+
+                    tx_db
+                        .fluent()
+                        .update()
+                        .in_col(REFRESH_TOKENS_COLLECTION)
+                        .precondition(FirestoreWritePrecondition::Exists(false))
+                        .document_id(&new_hash)
+                        .object(&new_record)
+                        .add_to_transaction(tx)?;
+
+                    Ok(RotateAttempt::Rotated(new_record))
+                })
+            })
+            .await
+            .map_err(|err| StoreError::Backend(err.to_string()))?;
+
+        match outcome {
+            RotateAttempt::Rotated(record) => Ok(record),
+            RotateAttempt::NotActive => {
+                self.revoke_family(&family_id).await?;
+                Err(StoreError::Reused)
+            }
+        }
+    }
+
+    async fn revoke_family(&self, family_id: &str) -> Result<(), StoreError> {
+        let family_id = family_id.to_string();
+
+        self.db
+            .run_transaction(move |tx_db, tx| {
+                let family_id = family_id.clone();
+                Box::pin(async move {
+                    let members = tx_db
+                        .fluent()
+                        .select()
+                        .from(REFRESH_TOKENS_COLLECTION)
+                        .filter(|q| q.field("family_id").eq(family_id.clone()))
+                        .obj::<RefreshTokenRecord>()
+                        .query()
+                        .await?;
+
+                    for member in members {
+                        if member.status == RefreshTokenStatus::Revoked {
+                            continue;
+                        }
+                        let mut revoked = member.clone();
+                        revoked.status = RefreshTokenStatus::Revoked;
+
+                        tx_db
+                            .fluent()
+                            .update()
+                            .in_col(REFRESH_TOKENS_COLLECTION)
+                            .precondition(FirestoreWritePrecondition::Exists(true))
+                            .document_id(&member.token_hash)
+                            .object(&revoked)
+                            .add_to_transaction(tx)?;
+                    }
+
+                    Ok(())
+                })
+            })
             .await
             .map_err(|err| StoreError::Backend(err.to_string()))
     }
