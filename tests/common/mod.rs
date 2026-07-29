@@ -7,11 +7,14 @@ use auth_service::dpop::PublicBaseUrl;
 use auth_service::random::{generate_opaque_token, hash_token};
 use auth_service::refresh_token::{RefreshTokenRecord, RefreshTokenStatus};
 use auth_service::store::firestore::{
-    FirestoreDpopReplayStore, FirestoreLoginAttemptStore, FirestoreRefreshTokenStore,
-    FirestoreUserStore,
+    FirestoreDpopReplayStore, FirestoreLoginAttemptStore, FirestoreRecoveryCodeStore,
+    FirestoreRefreshTokenStore, FirestoreUserStore,
 };
-use auth_service::store::{DpopReplayStore, LoginAttemptStore, RefreshTokenStore, UserStore};
+use auth_service::store::{
+    DpopReplayStore, LoginAttemptStore, RecoveryCodeStore, RefreshTokenStore, UserStore,
+};
 use auth_service::token::JwtKeys;
+use auth_service::totp::EnrollmentSecret;
 use auth_service::user::{NewUser, User};
 use chrono::{Duration as ChronoDuration, Utc};
 use firestore::{FirestoreDb, FirestoreDbOptions};
@@ -51,7 +54,9 @@ pub async fn test_app_state() -> AppState {
     let refresh_store: Arc<dyn RefreshTokenStore> =
         Arc::new(FirestoreRefreshTokenStore::new(db.clone()));
     let dpop_replay: Arc<dyn DpopReplayStore> = Arc::new(FirestoreDpopReplayStore::new(db.clone()));
-    let login_attempts: Arc<dyn LoginAttemptStore> = Arc::new(FirestoreLoginAttemptStore::new(db));
+    let login_attempts: Arc<dyn LoginAttemptStore> =
+        Arc::new(FirestoreLoginAttemptStore::new(db.clone()));
+    let recovery_codes: Arc<dyn RecoveryCodeStore> = Arc::new(FirestoreRecoveryCodeStore::new(db));
     let jwt = Arc::new(JwtKeys::new(
         TEST_JWT_SIGNING_SECRET,
         Duration::from_secs(600),
@@ -63,6 +68,7 @@ pub async fn test_app_state() -> AppState {
         refresh_store,
         dpop_replay,
         login_attempts,
+        recovery_codes,
         jwt,
         public_base_url,
     }
@@ -86,19 +92,56 @@ pub fn unique_email(prefix: &str) -> String {
 
 /// Creates a user directly via the store (bypassing /register's breach
 /// check + validation) for deterministic, fast test setup — same spirit as
-/// register.rs's own tests calling `find_by_email` directly.
+/// register.rs's own tests calling `find_by_email` directly. Stays
+/// `mfa_enrolled: false` — only usable for tests that don't call
+/// `/login` (Module 11 made MFA mandatory there); see
+/// `create_test_user_with_mfa` for a login-ready user.
 #[allow(dead_code)]
 pub async fn create_test_user(state: &AppState, email: &str, password: &str) -> User {
     let password_hash = auth_service::password::hash_password(password).unwrap();
+    let enrollment = auth_service::totp::generate_enrollment_secret(email);
     state
         .store
         .create_user(NewUser {
             user_id: auth_service::random::generate_opaque_token(16),
             email: email.to_string(),
             password_hash,
+            mfa_secret: enrollment.secret_bytes(),
         })
         .await
         .unwrap()
+}
+
+/// Creates a user and immediately confirms MFA enrollment directly via
+/// the store (bypassing the `/register` -> `/register/confirm` HTTP
+/// ceremony, matching this file's existing philosophy). Returns the
+/// enrollment secret so tests can generate valid codes inline via
+/// `enrollment.generate_current()`. Recovery codes are `vec![]` here —
+/// most login tests don't need them.
+#[allow(dead_code)]
+pub async fn create_test_user_with_mfa(
+    state: &AppState,
+    email: &str,
+    password: &str,
+) -> (User, EnrollmentSecret) {
+    let password_hash = auth_service::password::hash_password(password).unwrap();
+    let enrollment = auth_service::totp::generate_enrollment_secret(email);
+    state
+        .store
+        .create_user(NewUser {
+            user_id: auth_service::random::generate_opaque_token(16),
+            email: email.to_string(),
+            password_hash,
+            mfa_secret: enrollment.secret_bytes(),
+        })
+        .await
+        .unwrap();
+    let user = state
+        .store
+        .confirm_mfa_enrollment(email, vec![])
+        .await
+        .unwrap();
+    (user, enrollment)
 }
 
 /// Inserts a refresh token record directly via Firestore (bypassing

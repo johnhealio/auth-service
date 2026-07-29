@@ -6,7 +6,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use common::create_test_user;
+use common::{create_test_user, create_test_user_with_mfa};
 
 // Cloud-Run-shaped X-Forwarded-For, well within login_config()'s burst
 // (20) for the request counts these tests use — keeps the IP-based rate
@@ -14,6 +14,11 @@ use common::create_test_user;
 const XFF: &str = "203.0.113.50,35.190.0.1";
 
 async fn login_attempt(app: Router, email: &str, password: &str) -> (StatusCode, Value) {
+    // "mfa_code" is a filler value — every call in this file uses a wrong
+    // password (or is already locked out), so MFA is never reached; the
+    // field just needs to be present so the request passes JSON body
+    // deserialization (a missing required field is 422, not the
+    // 401/429 these tests assert).
     let response = app
         .oneshot(
             Request::builder()
@@ -22,7 +27,10 @@ async fn login_attempt(app: Router, email: &str, password: &str) -> (StatusCode,
                 .header("content-type", "application/json")
                 .header("x-forwarded-for", XFF)
                 .body(Body::from(
-                    serde_json::to_vec(&json!({ "email": email, "password": password })).unwrap(),
+                    serde_json::to_vec(
+                        &json!({ "email": email, "password": password, "mfa_code": "000000" }),
+                    )
+                    .unwrap(),
                 ))
                 .unwrap(),
         )
@@ -61,8 +69,12 @@ async fn login_locks_out_after_threshold_failures() {
                 .header("content-type", "application/json")
                 .header("x-forwarded-for", XFF)
                 .body(Body::from(
-                    serde_json::to_vec(&json!({ "email": email, "password": "wrong password" }))
-                        .unwrap(),
+                    serde_json::to_vec(&json!({
+                        "email": email,
+                        "password": "wrong password",
+                        "mfa_code": "000000"
+                    }))
+                    .unwrap(),
                 ))
                 .unwrap(),
         )
@@ -87,7 +99,7 @@ async fn successful_login_resets_attempt_counter() {
     let state = common::test_app_state().await;
     let email = common::unique_email("lockout-reset");
     let password = "a genuinely long passphrase 8";
-    create_test_user(&state, &email, password).await;
+    let (_, enrollment) = create_test_user_with_mfa(&state, &email, password).await;
 
     // A handful of failures, well under the threshold.
     for _ in 0..5 {
@@ -109,7 +121,12 @@ async fn successful_login_resets_attempt_counter() {
                 .header("x-forwarded-for", XFF)
                 .header("DPoP", proof)
                 .body(Body::from(
-                    serde_json::to_vec(&json!({ "email": email, "password": password })).unwrap(),
+                    serde_json::to_vec(&json!({
+                        "email": email,
+                        "password": password,
+                        "mfa_code": enrollment.generate_current()
+                    }))
+                    .unwrap(),
                 ))
                 .unwrap(),
         )

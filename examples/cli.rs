@@ -1,18 +1,31 @@
-//! Example CLI client for auth-service: registration, DPoP-bound login,
-//! refresh-token rotation, and calling the protected `/me` endpoint.
+//! Example CLI client for auth-service: mandatory-MFA registration,
+//! DPoP-bound login, refresh-token rotation, logout, and calling the
+//! protected `/me` endpoint.
 //!
 //! Run against a locally running server (`cargo run`, or `docker compose
 //! up`):
 //!   cargo run --example cli -- register <email> <password>
-//!   cargo run --example cli -- login <email> <password>
+//!   cargo run --example cli -- confirm <email> <mfa-code>
+//!   cargo run --example cli -- login <email> <password> <mfa-code>
 //!   cargo run --example cli -- refresh
 //!   cargo run --example cli -- me
+//!   cargo run --example cli -- logout
+//!
+//! `register` prints an `otpauth://` URL and base32 secret — add it to a
+//! real authenticator app (or any TOTP-compatible tool), then run
+//! `confirm` with the 6-digit code it shows. The account isn't usable for
+//! `login` until `confirm` succeeds. `confirm` prints 10 single-use
+//! recovery codes exactly once — save them; either a TOTP code or one of
+//! these codes works as `login`'s `<mfa-code>` argument, since the
+//! server-side TOTP secret only ever lives in your authenticator app, not
+//! in anything this CLI persists.
 //!
 //! `login` generates a fresh DPoP keypair and persists it (with the
 //! access/refresh tokens it's bound to) to `.auth-cli-state.json` in the
 //! current directory, so later `refresh`/`me` calls can reuse the same
 //! key — DPoP proofs must be signed by the key a token was issued to.
-//! Target base URL: `AUTH_SERVICE_URL` env var, default
+//! `logout` revokes the saved refresh token's family and clears that
+//! state file. Target base URL: `AUTH_SERVICE_URL` env var, default
 //! `http://localhost:8080` (must match the server's own `PUBLIC_BASE_URL`
 //! exactly, since DPoP proofs are validated against it).
 
@@ -135,26 +148,47 @@ async fn main() {
             let (email, password) = require_email_password(&args);
             register(&email, &password).await;
         }
+        Some("confirm") => {
+            let (email, code) = require_two_args(&args, "<email> <mfa-code>");
+            confirm(&email, &code).await;
+        }
         Some("login") => {
-            let (email, password) = require_email_password(&args);
-            login(&email, &password).await;
+            let (email, password, mfa_code) = require_email_password_code(&args);
+            login(&email, &password, &mfa_code).await;
         }
         Some("refresh") => refresh().await,
         Some("me") => me().await,
+        Some("logout") => logout().await,
         _ => {
             eprintln!(
-                "usage:\n  cargo run --example cli -- register <email> <password>\n  cargo run --example cli -- login <email> <password>\n  cargo run --example cli -- refresh\n  cargo run --example cli -- me"
+                "usage:\n  cargo run --example cli -- register <email> <password>\n  cargo run --example cli -- confirm <email> <mfa-code>\n  cargo run --example cli -- login <email> <password> <mfa-code>\n  cargo run --example cli -- refresh\n  cargo run --example cli -- me\n  cargo run --example cli -- logout"
             );
             std::process::exit(1);
         }
     }
 }
 
-fn require_email_password(args: &[String]) -> (String, String) {
+fn require_two_args(args: &[String], usage: &str) -> (String, String) {
     match (args.get(2), args.get(3)) {
-        (Some(email), Some(password)) => (email.clone(), password.clone()),
+        (Some(a), Some(b)) => (a.clone(), b.clone()),
         _ => {
-            eprintln!("expected <email> <password> arguments");
+            eprintln!("expected {usage} arguments");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn require_email_password(args: &[String]) -> (String, String) {
+    require_two_args(args, "<email> <password>")
+}
+
+fn require_email_password_code(args: &[String]) -> (String, String, String) {
+    match (args.get(2), args.get(3), args.get(4)) {
+        (Some(email), Some(password), Some(mfa_code)) => {
+            (email.clone(), password.clone(), mfa_code.clone())
+        }
+        _ => {
+            eprintln!("expected <email> <password> <mfa-code> arguments");
             std::process::exit(1);
         }
     }
@@ -169,10 +203,49 @@ async fn register(email: &str, password: &str) {
         .await
         .expect("send register request");
 
-    print_response("register", response).await;
+    if !response.status().is_success() {
+        print_response("register", response).await;
+        return;
+    }
+
+    let body: serde_json::Value = response.json().await.expect("parse register response");
+    println!("registered {email} — account not usable for login yet.");
+    println!(
+        "add this to an authenticator app: {}",
+        body["mfa_enrollment_url"].as_str().unwrap_or("")
+    );
+    println!(
+        "or enter this secret manually: {}",
+        body["mfa_secret_base32"].as_str().unwrap_or("")
+    );
+    println!("then run: cargo run --example cli -- confirm {email} <code-from-app>");
 }
 
-async fn login(email: &str, password: &str) {
+async fn confirm(email: &str, mfa_code: &str) {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/register/confirm", base_url()))
+        .json(&serde_json::json!({ "email": email, "mfa_code": mfa_code }))
+        .send()
+        .await
+        .expect("send confirm request");
+
+    if !response.status().is_success() {
+        print_response("confirm", response).await;
+        return;
+    }
+
+    let body: serde_json::Value = response.json().await.expect("parse confirm response");
+    println!("MFA enrollment confirmed for {email}.");
+    println!("SAVE THESE RECOVERY CODES NOW — shown exactly once, never retrievable again:");
+    if let Some(codes) = body["recovery_codes"].as_array() {
+        for code in codes {
+            println!("  {}", code.as_str().unwrap_or(""));
+        }
+    }
+}
+
+async fn login(email: &str, password: &str, mfa_code: &str) {
     let client = reqwest::Client::new();
     let (der, encoding_key, jwk) = generate_keypair();
     let htu = format!("{}/login", base_url());
@@ -181,7 +254,7 @@ async fn login(email: &str, password: &str) {
     let response = client
         .post(&htu)
         .header("DPoP", proof)
-        .json(&serde_json::json!({ "email": email, "password": password }))
+        .json(&serde_json::json!({ "email": email, "password": password, "mfa_code": mfa_code }))
         .send()
         .await
         .expect("send login request");
@@ -270,6 +343,30 @@ async fn me() {
         .expect("send me request");
 
     print_response("me", response).await;
+}
+
+async fn logout() {
+    let state = CliState::load();
+    let Some(refresh_token) = state.refresh_token.clone() else {
+        eprintln!("no saved session — nothing to log out of");
+        return;
+    };
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/logout", base_url()))
+        .json(&serde_json::json!({ "refresh_token": refresh_token }))
+        .send()
+        .await
+        .expect("send logout request");
+
+    print_response("logout", response).await;
+
+    if let Err(err) = fs::remove_file(STATE_FILE)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("warning: failed to remove {STATE_FILE}: {err}");
+    }
 }
 
 async fn print_response(label: &str, response: reqwest::Response) {

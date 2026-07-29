@@ -8,7 +8,7 @@ use tower::ServiceExt;
 
 use auth_service::AppState;
 use common::TEST_PUBLIC_BASE_URL;
-use common::create_test_user;
+use common::create_test_user_with_mfa;
 use common::dpop::{DpopKeypair, DpopProofBuilder};
 
 fn login_url() -> String {
@@ -84,7 +84,7 @@ async fn login_session(prefix: &str) -> Session {
     let state = common::test_app_state().await;
     let email = common::unique_email(prefix);
     let password = "a genuinely long dpop test passphrase";
-    create_test_user(&state, &email, password).await;
+    let (_, enrollment) = create_test_user_with_mfa(&state, &email, password).await;
 
     let keypair = DpopKeypair::generate();
     let login_proof = DpopProofBuilder::new("POST", &login_url()).sign(&keypair);
@@ -92,7 +92,7 @@ async fn login_session(prefix: &str) -> Session {
     let (status, body) = post_json(
         auth_service::app(state.clone()),
         "/login",
-        json!({ "email": email, "password": password }),
+        json!({ "email": email, "password": password, "mfa_code": enrollment.generate_current() }),
         Some(&login_proof),
     )
     .await;

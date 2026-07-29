@@ -34,33 +34,36 @@ separate decisions made in sequence.
   emulator; this sandbox has no Java to run it
 
 ## Status
-Modules 1–10 complete (tags `v0.1.0` = Modules 1–2, `v0.2.0` = Module 3,
+Modules 1–11 complete (tags `v0.1.0` = Modules 1–2, `v0.2.0` = Module 3,
 `v0.3.0` = Module 4, `v0.4.0` = Module 6, `v0.5.0` = Module 7, `v0.6.0` =
-Module 8, `v0.7.0` = Module 9). Module 4 absorbed the original Module 5
-scope ("protected route middleware, bearer-only, pre-DPoP") — `GET /me`
-and the `AuthUser` bearer extractor were built then rather than deferred.
-Module 6 (DPoP proof-of-possession) made DPoP mandatory at login and on
-`/me`. Module 7 (DPoP-bound refresh rotation) enforced the `jkt` binding
-stored since Module 6, rotating on every use and detecting/revoking
-reused tokens — the last module with a roadmap-flagged pause point.
-Module 8 (Terraform + Cloud Run) provides the Dockerfile and
-`terraform/production/` IaC; Docker and Terraform were subsequently
-installed on this VM for local image builds/testing, but `docker
-push`/`terraform apply` against GCP are still deliberately laptop-only
-(the VM's own identity has zero IAM permissions by design — see Module
-3's dev-bootstrap decision), so actual deployment still hasn't happened
-as of this commit. Module 9 (local dev polish) consolidated the four
-handlers' duplicated JSON error-building into one shared module (closing
-a real gap: malformed JSON bodies now get this app's error shape instead
-of axum's default), added `.env` support, a single-service
-`docker-compose.yml`, real `README.md` setup docs, and an
+Module 8, `v0.7.0` = Module 9, `v0.8.0` = Module 10). Module 4 absorbed
+the original Module 5 scope ("protected route middleware, bearer-only,
+pre-DPoP") — `GET /me` and the `AuthUser` bearer extractor were built
+then rather than deferred. Module 6 (DPoP proof-of-possession) made DPoP
+mandatory at login and on `/me`. Module 7 (DPoP-bound refresh rotation)
+enforced the `jkt` binding stored since Module 6, rotating on every use
+and detecting/revoking reused tokens — the last module with a
+roadmap-flagged pause point. Module 8 (Terraform + Cloud Run) provides
+the Dockerfile and `terraform/production/` IaC; Docker and Terraform
+were subsequently installed on this VM for local image builds/testing,
+but `docker push`/`terraform apply` against GCP are still deliberately
+laptop-only (the VM's own identity has zero IAM permissions by design —
+see Module 3's dev-bootstrap decision), so actual deployment still
+hasn't happened as of this commit. Module 9 (local dev polish)
+consolidated the four handlers' duplicated JSON error-building into one
+shared module (closing a real gap: malformed JSON bodies now get this
+app's error shape instead of axum's default), added `.env` support, a
+single-service `docker-compose.yml`, real `README.md` setup docs, and an
 `examples/cli.rs` reference client. Module 10 (hardening pass) resolved
 the "no rate limiting exists yet" gap flagged since Module 3 — IP-based
 rate limiting on `/register`/`/login`/`/refresh` with a custom
 Cloud-Run-correct key extractor, a separate per-account login lockout,
 global security response headers, and a scheduled GitHub Actions
-dependency audit (this repo's first CI). Next: actually executing Module
-8's deployment from a privileged laptop, or further hardening.
+dependency audit (this repo's first CI). Module 11 made TOTP-based MFA
+mandatory for every account (mirroring Module 6's DPoP optional→mandatory
+precedent) — a two-step registration ceremony, single-use recovery
+codes, and a new `/logout` endpoint. Next: actually executing Module 8's
+deployment from a privileged laptop, or further hardening.
 
 ## Decisions made so far
 
@@ -541,6 +544,92 @@ minimal — no build/test job, no matrix — not the general CI/Cloud Build
 pipeline Module 8 explicitly deferred; `rustsec/audit-check` installs
 `cargo-audit` itself, so nothing was added to `Cargo.toml`.
 
+### Module 11: MFA mandatory for every account, mirroring Module 6's DPoP precedent
+`totp-rs` (`default-features = false, features = ["otpauth", "gen_secret"]`
+— confirmed via a real scratch build, not just crate metadata), RFC 6238
+TOTP with `skew = 1` (±30s, RFC 6238's own recommendation, same spirit as
+DPoP's ±60s clock-skew constant). Confirmed with the user: mandatory for
+every account, not opt-in — the same optional-to-mandatory shape Module 6
+used for DPoP, including the same tradeoff (breaks existing tests "in the
+expected way," no bypass path). Registration is now two steps: `/register`
+generates a TOTP secret and returns an `otpauth://` URL + base32 secret;
+the account isn't usable for login until `/register/confirm` verifies a
+real code, which also generates 10 single-use recovery codes (returned in
+plaintext exactly once). All TOTP logic lives in `src/totp.rs`, out of the
+store layer — mirrors how `dpop.rs`'s proof verification is separate from
+`DpopReplayStore`'s pure persistence.
+
+**Rejected a Plan agent's design for abandoned/unconfirmed registrations.**
+Its draft let `/register` silently overwrite an existing *unconfirmed*
+record with a new password + new MFA secret, so a stuck enrollment could
+self-service-recover. Rejected: nothing in that design proved the
+re-registerer knew the *original* password, so anyone who merely knew an
+email had a pending registration could hijack it — re-register under their
+own password, get their own fresh secret, confirm, and own the account
+before the real registrant ever finished. It would also add a timing
+side-channel (Argon2-verify only running on the "pending" branch leaks
+which emails have abandoned signups) — exactly the class of leak Module
+4's `DUMMY_HASH` exists to prevent. Properly closing this (verify the
+*plaintext* password against the existing hash before allowing a resume,
+plus a dummy-hash timing-parity branch for the other cases) is real,
+disproportionate complexity for a learning project with no live users —
+same reasoning Module 6 used to defer DPoP-Nonce. `create_user` is
+untouched: still today's unconditional `.insert()`, still `409` for any
+existing email regardless of confirmation state. An abandoned
+registration permanently occupies its email with no self-service
+recovery — accepted limitation, documented as future work, not solved
+here.
+
+**Recovery codes**: `recovery_codes` Firestore collection, one document
+per code (not one doc per user with an array) — doc ID = `hash_token(code)`
+(SHA-256), mirroring `RefreshTokenRecord`'s "hash as doc ID" pattern.
+Server-generated random values, not human-chosen, so `generate_opaque_token`/
+`hash_token` is the right precedent (already used for refresh tokens) —
+not Argon2, which `password.rs` reserves specifically for human-chosen
+secrets. Redemption (`RecoveryCodeStore::redeem`) is the same transactional
+read-check-mark-consumed pattern as `LoginAttemptStore::record_failure`,
+so concurrent double-spend of one code can't both succeed.
+`confirm_mfa_enrollment` (new `UserStore` method) sets `mfa_enrolled = true`
+**and** writes all 10 recovery-code records in one transaction — a
+confirmed account with missing recovery codes (or vice versa) would be an
+unrecoverable partial state.
+
+**Login insertion point**: a new required `mfa_code` field on
+`LoginRequest`, checked between the existing lockout-reset and DPoP-header
+check — after credentials succeed (so a wrong/missing code doesn't leak
+account existence, same reasoning as DPoP's own placement) but before
+DPoP validation. Tried first as a TOTP code, then as a recovery code — one
+field accepts either shape, since a non-matching string just fails
+harmlessly either way. A wrong code increments the *same* lockout counter
+as a wrong password (`login_attempts`, Module 10) — one shared per-account
+brute-force budget, not two independent mechanisms. This required bumping
+`/login`'s rate-limit burst from 10 to 20 (`src/rate_limit.rs`): it used to
+exactly equal the lockout threshold, which meant the coarser IP limiter
+would always intercept the request that should have triggered the precise
+per-account lockout, since the rate-limit middleware runs before the
+handler.
+
+**Verified, not assumed**: axum 0.8.9's real source
+(`extract/rejection.rs`) confirms a JSON body missing a required field is
+classified `JsonDataError` → `422 UNPROCESSABLE_ENTITY`, not 400 — checked
+directly against the crate source since this determined how much of the
+existing test suite needed updating (every test posting to `/login`
+without the new `mfa_code` field, not just the ones exercising MFA
+specifically).
+
+**`/logout`**: deliberately simple per explicit request ("mostly to just
+cancel the refresh token and make the process look complete") — no DPoP
+requirement, looks up the refresh token and calls the existing
+`RefreshTokenStore::revoke_family` (already built for Module 7's
+reuse-detection path, just not previously exposed as its own endpoint).
+Always returns `{"logged_out": true}` regardless of whether the token was
+found/valid — an unconditional response, not just an identical error
+shape, so the endpoint can't be used to probe token validity at all. Note
+the inherent limit this doesn't solve: revoking the refresh token family
+ends the *session* (no more silent refreshes) but can't invalidate an
+already-issued access token, which is a stateless JWT valid until its own
+TTL — same tradeoff Module 4 already accepted for access tokens generally.
+
 ## Constraints
 - No secrets or credentials ever committed to the repo or written into code.
 - Firestore access from the deployed service should use a dedicated service
@@ -558,5 +647,6 @@ pipeline Module 8 explicitly deferred; `rustsec/audit-check` installs
   test-only signing secret and base URL, see `tests/common/mod.rs`). As of
   Module 9, `cp .env.example .env` + fill in values is equivalent — `cargo
   run` loads `.env` automatically — or `docker compose up --build`.
-- Example CLI client: `cargo run --example cli -- register|login|refresh|me`
-  (see README.md)
+- Example CLI client: `cargo run --example cli -- register|confirm|login|refresh|me|logout`
+  (see README.md) — `register` then `confirm` is a two-step MFA
+  enrollment ceremony (Module 11); `login` takes an `<mfa-code>` argument.

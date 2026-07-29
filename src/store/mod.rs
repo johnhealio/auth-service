@@ -22,6 +22,12 @@ pub enum StoreError {
     /// the reuse signal. The whole token family has been revoked as a
     /// side effect of returning this variant.
     Reused,
+    /// A `/register/confirm` attempt for an account whose `mfa_enrolled`
+    /// was already `true` — a replayed/duplicate confirm, not a normal
+    /// error path. Named specifically (not folded into `DuplicateEmail`,
+    /// which is about the *email*, not the *enrollment state*) to match
+    /// this project's existing specific-variant style (`Replayed`, `Reused`).
+    MfaAlreadyEnrolled,
     Backend(String),
 }
 
@@ -33,6 +39,7 @@ impl fmt::Display for StoreError {
             StoreError::NotFound => write!(f, "record not found"),
             StoreError::Expired => write!(f, "record expired"),
             StoreError::Reused => write!(f, "refresh token reused; family revoked"),
+            StoreError::MfaAlreadyEnrolled => write!(f, "MFA already enrolled for this account"),
             StoreError::Backend(message) => write!(f, "backend error: {message}"),
         }
     }
@@ -48,6 +55,21 @@ pub trait UserStore: Send + Sync {
     /// but needed to verify what got stored (this test suite) and by login
     /// (Module 4) to check a submitted password against the stored hash.
     async fn find_by_email(&self, email: &str) -> Result<Option<User>, StoreError>;
+
+    /// Atomically flips `mfa_enrolled` to `true` and creates one
+    /// recovery-code record per hash in `recovery_code_hashes`, in a
+    /// single transaction — a confirmed account with no recovery codes
+    /// (or vice versa) would be a partially-migrated, unrecoverable
+    /// state. `recovery_code_hashes` are pre-hashed (SHA-256,
+    /// `random::hash_token`) by the caller; only hashes are ever
+    /// persisted. Returns `StoreError::NotFound` if no such account
+    /// exists, or `StoreError::MfaAlreadyEnrolled` if it's already
+    /// confirmed (a replayed/duplicate confirm attempt).
+    async fn confirm_mfa_enrollment(
+        &self,
+        email: &str,
+        recovery_code_hashes: Vec<String>,
+    ) -> Result<User, StoreError>;
 }
 
 #[async_trait]
@@ -115,4 +137,17 @@ pub trait LoginAttemptStore: Send + Sync {
     /// Clears accumulated failure history after a successful login, so
     /// occasional typos don't eventually lock out a legitimate user.
     async fn reset(&self, normalized_email: &str) -> Result<(), StoreError>;
+}
+
+#[async_trait]
+pub trait RecoveryCodeStore: Send + Sync {
+    /// Atomically checks whether `code_hash` is an *unconsumed* recovery
+    /// code belonging to `user_email` and, if so, marks it consumed in
+    /// the same transaction — concurrent double-spend of one code (e.g.
+    /// two simultaneous login attempts racing) must not both succeed.
+    /// `Ok(true)` = valid and now consumed; `Ok(false)` = no such
+    /// unconsumed code for this user — wrong code, already used, or
+    /// belongs to someone else, deliberately not distinguished, same
+    /// collapse-point spirit as `login::DUMMY_HASH`.
+    async fn redeem(&self, user_email: &str, code_hash: &str) -> Result<bool, StoreError>;
 }

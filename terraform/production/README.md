@@ -27,8 +27,8 @@ terraform init
 # 1. Build and push the image first (tag matches the repo's vX.Y.Z convention)
 gcloud auth configure-docker us-central1-docker.pkg.dev
 cd ../..
-docker build -t us-central1-docker.pkg.dev/johnhealio-claude-code/auth-service/auth-service:v0.6.0 .
-docker push us-central1-docker.pkg.dev/johnhealio-claude-code/auth-service/auth-service:v0.6.0
+docker build -t us-central1-docker.pkg.dev/johnhealio-claude-code/auth-service/auth-service:v0.8.0 .
+docker push us-central1-docker.pkg.dev/johnhealio-claude-code/auth-service/auth-service:v0.8.0
 cd terraform/production
 
 # 2. Create just the empty Secret Manager container (and everything else
@@ -42,14 +42,14 @@ openssl rand -hex 32 | gcloud secrets versions add jwt-signing-secret \
 # 4. First full apply — deploys Cloud Run with a placeholder PUBLIC_BASE_URL.
 #    /healthz will work at this point; DPoP-protected endpoints won't yet.
 terraform apply \
-  -var="container_image=us-central1-docker.pkg.dev/johnhealio-claude-code/auth-service/auth-service:v0.6.0"
+  -var="container_image=us-central1-docker.pkg.dev/johnhealio-claude-code/auth-service/auth-service:v0.8.0"
 
 # 5. Read the real URL Cloud Run assigned
 terraform output cloud_run_url
 
 # 6. Re-apply with the real URL, so DPoP htu validation matches reality
 terraform apply \
-  -var="container_image=us-central1-docker.pkg.dev/johnhealio-claude-code/auth-service/auth-service:v0.6.0" \
+  -var="container_image=us-central1-docker.pkg.dev/johnhealio-claude-code/auth-service/auth-service:v0.8.0" \
   -var="public_base_url=<the URL from step 5>"
 ```
 

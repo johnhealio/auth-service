@@ -131,6 +131,13 @@ pub fn refresh_config() -> Config {
     build(20, 12)
 }
 
+// /logout: a legitimate client calling logout is similarly low-frequency,
+// and this endpoint touches no lockout/DPoP state to reason about
+// separately — same shape as refresh_config().
+pub fn logout_config() -> Config {
+    build(20, 12)
+}
+
 /// Normalizes tower_governor's own plain-text rejection body into this
 /// app's `{"error","message"}` shape (see src/error.rs).
 /// `GovernorError::UnableToExtractKey` never actually happens with

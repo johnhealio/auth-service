@@ -8,8 +8,8 @@ use tower::ServiceExt;
 
 use auth_service::refresh_token::REFRESH_TOKEN_TTL_DAYS;
 use common::TEST_PUBLIC_BASE_URL;
-use common::create_test_user;
 use common::dpop::{DpopKeypair, DpopProofBuilder};
+use common::{create_test_user, create_test_user_with_mfa};
 
 async fn post_json(
     app: Router,
@@ -77,7 +77,7 @@ async fn login_succeeds_and_returns_valid_tokens() {
     let state = common::test_app_state().await;
     let email = common::unique_email("login-success");
     let password = "a genuinely long passphrase 3";
-    let user = create_test_user(&state, &email, password).await;
+    let (user, enrollment) = create_test_user_with_mfa(&state, &email, password).await;
 
     let keypair = DpopKeypair::generate();
     let proof = DpopProofBuilder::new("POST", &login_url()).sign(&keypair);
@@ -85,7 +85,7 @@ async fn login_succeeds_and_returns_valid_tokens() {
     let (status, body) = post_json(
         auth_service::app(state.clone()),
         "/login",
-        json!({ "email": email, "password": password }),
+        json!({ "email": email, "password": password, "mfa_code": enrollment.generate_current() }),
         Some(&proof),
     )
     .await;
@@ -123,12 +123,12 @@ async fn login_without_dpop_header_rejected() {
     let state = common::test_app_state().await;
     let email = common::unique_email("login-no-dpop");
     let password = "a genuinely long passphrase 3a";
-    create_test_user(&state, &email, password).await;
+    let (_, enrollment) = create_test_user_with_mfa(&state, &email, password).await;
 
     let (status, body) = post_json(
         auth_service::app(state.clone()),
         "/login",
-        json!({ "email": email, "password": password }),
+        json!({ "email": email, "password": password, "mfa_code": enrollment.generate_current() }),
         None,
     )
     .await;
@@ -145,11 +145,15 @@ async fn wrong_password_and_unknown_email_return_identical_generic_error() {
     create_test_user(&state, &email, password).await;
 
     // No DPoP header needed here: credential verification fails before
-    // DPoP is ever considered, so both these paths short-circuit first.
+    // DPoP (or MFA) is ever considered, so both these paths short-circuit
+    // first. "mfa_code" is a filler value here — it's only required so
+    // the request passes JSON body deserialization at all (a missing
+    // required field is a 422, not the 401 this test is about); its
+    // actual value never gets checked since the password fails first.
     let (wrong_status, wrong_body) = post_json(
         auth_service::app(state.clone()),
         "/login",
-        json!({ "email": email, "password": "not the right password" }),
+        json!({ "email": email, "password": "not the right password", "mfa_code": "000000" }),
         None,
     )
     .await;
@@ -158,7 +162,7 @@ async fn wrong_password_and_unknown_email_return_identical_generic_error() {
     let (unknown_status, unknown_body) = post_json(
         auth_service::app(state.clone()),
         "/login",
-        json!({ "email": unknown_email, "password": "whatever password" }),
+        json!({ "email": unknown_email, "password": "whatever password", "mfa_code": "000000" }),
         None,
     )
     .await;
@@ -176,7 +180,7 @@ async fn logins_for_same_user_have_unique_jti() {
     let state = common::test_app_state().await;
     let email = common::unique_email("login-jti-unique");
     let password = "a genuinely long passphrase 5";
-    create_test_user(&state, &email, password).await;
+    let (_, enrollment) = create_test_user_with_mfa(&state, &email, password).await;
 
     let keypair = DpopKeypair::generate();
 
@@ -184,7 +188,7 @@ async fn logins_for_same_user_have_unique_jti() {
     let (_, body_a) = post_json(
         auth_service::app(state.clone()),
         "/login",
-        json!({ "email": email, "password": password }),
+        json!({ "email": email, "password": password, "mfa_code": enrollment.generate_current() }),
         Some(&proof_a),
     )
     .await;
@@ -193,7 +197,7 @@ async fn logins_for_same_user_have_unique_jti() {
     let (_, body_b) = post_json(
         auth_service::app(state.clone()),
         "/login",
-        json!({ "email": email, "password": password }),
+        json!({ "email": email, "password": password, "mfa_code": enrollment.generate_current() }),
         Some(&proof_b),
     )
     .await;
@@ -215,7 +219,7 @@ async fn access_token_authenticates_protected_route() {
     let state = common::test_app_state().await;
     let email = common::unique_email("login-me-route");
     let password = "a genuinely long passphrase 6";
-    let user = create_test_user(&state, &email, password).await;
+    let (user, enrollment) = create_test_user_with_mfa(&state, &email, password).await;
 
     let keypair = DpopKeypair::generate();
     let login_proof = DpopProofBuilder::new("POST", &login_url()).sign(&keypair);
@@ -223,7 +227,7 @@ async fn access_token_authenticates_protected_route() {
     let (_, login_body) = post_json(
         auth_service::app(state.clone()),
         "/login",
-        json!({ "email": email, "password": password }),
+        json!({ "email": email, "password": password, "mfa_code": enrollment.generate_current() }),
         Some(&login_proof),
     )
     .await;

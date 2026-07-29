@@ -12,7 +12,8 @@ use crate::refresh_token::{
     RefreshTokenStatus,
 };
 use crate::store::{
-    DpopReplayStore, LoginAttemptState, LoginAttemptStore, RefreshTokenStore, StoreError, UserStore,
+    DpopReplayStore, LoginAttemptState, LoginAttemptStore, RecoveryCodeStore, RefreshTokenStore,
+    StoreError, UserStore,
 };
 use crate::user::{NewUser, User};
 
@@ -20,6 +21,7 @@ const USERS_COLLECTION: &str = "users";
 const REFRESH_TOKENS_COLLECTION: &str = "refresh_tokens";
 const DPOP_JTI_COLLECTION: &str = "dpop_jti";
 const LOGIN_ATTEMPTS_COLLECTION: &str = "login_attempts";
+const RECOVERY_CODES_COLLECTION: &str = "recovery_codes";
 
 // OWASP-baseline-style lockout, same framing as Module 3's Argon2
 // baseline: lenient enough not to lock out a user hitting a few typos,
@@ -48,6 +50,8 @@ impl UserStore for FirestoreUserStore {
             email: new_user.email,
             password_hash: new_user.password_hash,
             created_at: Utc::now(),
+            mfa_secret: new_user.mfa_secret,
+            mfa_enrolled: false,
         };
 
         self.db
@@ -74,6 +78,79 @@ impl UserStore for FirestoreUserStore {
             .await
             .map_err(|err| StoreError::Backend(err.to_string()))
     }
+
+    async fn confirm_mfa_enrollment(
+        &self,
+        email: &str,
+        recovery_code_hashes: Vec<String>,
+    ) -> Result<User, StoreError> {
+        let email = email.to_string();
+
+        let outcome = self
+            .db
+            .run_transaction(move |tx_db, tx| {
+                let email = email.clone();
+                let recovery_code_hashes = recovery_code_hashes.clone();
+                Box::pin(async move {
+                    let current = tx_db
+                        .fluent()
+                        .select()
+                        .by_id_in(USERS_COLLECTION)
+                        .obj::<User>()
+                        .one(&email)
+                        .await?;
+
+                    let Some(mut user) = current else {
+                        return Ok(ConfirmMfaOutcome::NotFound);
+                    };
+                    if user.mfa_enrolled {
+                        return Ok(ConfirmMfaOutcome::AlreadyEnrolled);
+                    }
+                    user.mfa_enrolled = true;
+
+                    tx_db
+                        .fluent()
+                        .update()
+                        .in_col(USERS_COLLECTION)
+                        .precondition(FirestoreWritePrecondition::Exists(true))
+                        .document_id(&email)
+                        .object(&user)
+                        .add_to_transaction(tx)?;
+
+                    for hash in &recovery_code_hashes {
+                        let record = RecoveryCodeRecord {
+                            user_email: email.clone(),
+                            consumed: false,
+                        };
+                        tx_db
+                            .fluent()
+                            .update()
+                            .in_col(RECOVERY_CODES_COLLECTION)
+                            .precondition(FirestoreWritePrecondition::Exists(false))
+                            .document_id(hash)
+                            .object(&record)
+                            .add_to_transaction(tx)?;
+                    }
+
+                    Ok(ConfirmMfaOutcome::Confirmed(user))
+                })
+            })
+            .await
+            .map_err(|err| StoreError::Backend(err.to_string()))?;
+
+        match outcome {
+            ConfirmMfaOutcome::Confirmed(user) => Ok(user),
+            ConfirmMfaOutcome::AlreadyEnrolled => Err(StoreError::MfaAlreadyEnrolled),
+            ConfirmMfaOutcome::NotFound => Err(StoreError::NotFound),
+        }
+    }
+}
+
+/// Outcome of a single `confirm_mfa_enrollment` transaction attempt.
+enum ConfirmMfaOutcome {
+    Confirmed(User),
+    AlreadyEnrolled,
+    NotFound,
 }
 
 /// Outcome of a single rotation-transaction attempt. `NotActive` means the
@@ -484,6 +561,75 @@ impl LoginAttemptStore for FirestoreLoginAttemptStore {
             .from(LOGIN_ATTEMPTS_COLLECTION)
             .document_id(normalized_email)
             .execute()
+            .await
+            .map_err(|err| StoreError::Backend(err.to_string()))
+    }
+}
+
+/// Firestore document shape for `recovery_codes/{sha256_hex(code)}` — doc
+/// ID *is* the hash (mirrors `RefreshTokenRecord`'s "hash as doc ID"
+/// pattern exactly). One document per code, not one doc per user with an
+/// array, so redemption is a single-document transactional read-check-write
+/// with no read-modify-write race over a shared array field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecoveryCodeRecord {
+    user_email: String,
+    consumed: bool,
+}
+
+pub struct FirestoreRecoveryCodeStore {
+    db: FirestoreDb,
+}
+
+impl FirestoreRecoveryCodeStore {
+    pub fn new(db: FirestoreDb) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl RecoveryCodeStore for FirestoreRecoveryCodeStore {
+    async fn redeem(&self, user_email: &str, code_hash: &str) -> Result<bool, StoreError> {
+        let user_email = user_email.to_string();
+        let code_hash = code_hash.to_string();
+
+        self.db
+            .run_transaction(move |tx_db, tx| {
+                let user_email = user_email.clone();
+                let code_hash = code_hash.clone();
+                Box::pin(async move {
+                    let current = tx_db
+                        .fluent()
+                        .select()
+                        .by_id_in(RECOVERY_CODES_COLLECTION)
+                        .obj::<RecoveryCodeRecord>()
+                        .one(&code_hash)
+                        .await?;
+
+                    let Some(record) = current else {
+                        return Ok(false);
+                    };
+                    if record.consumed || record.user_email != user_email {
+                        return Ok(false);
+                    }
+
+                    let consumed_record = RecoveryCodeRecord {
+                        consumed: true,
+                        ..record
+                    };
+
+                    tx_db
+                        .fluent()
+                        .update()
+                        .in_col(RECOVERY_CODES_COLLECTION)
+                        .precondition(FirestoreWritePrecondition::Exists(true))
+                        .document_id(&code_hash)
+                        .object(&consumed_record)
+                        .add_to_transaction(tx)?;
+
+                    Ok(true)
+                })
+            })
             .await
             .map_err(|err| StoreError::Backend(err.to_string()))
     }

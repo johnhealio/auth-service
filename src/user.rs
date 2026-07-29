@@ -14,12 +14,24 @@ pub struct User {
     pub password_hash: String,
     #[serde(with = "firestore::serialize_as_timestamp")]
     pub created_at: DateTime<Utc>,
+    /// Raw TOTP secret bytes, generated at `/register` time (Module 11).
+    /// Present even before enrollment is confirmed — `mfa_enrolled` is
+    /// the field that gates login, not this one's presence.
+    pub mfa_secret: Vec<u8>,
+    /// False until `/register/confirm` verifies a real code. `/login`
+    /// refuses any account with `mfa_enrolled: false` the same way
+    /// Module 6 made DPoP mandatory — no bypass path.
+    pub mfa_enrolled: bool,
 }
 
 /// Data needed to create a user; `created_at` is assigned by the store at
-/// write time rather than by the caller.
+/// write time rather than by the caller. `mfa_enrolled` isn't settable
+/// here — it always starts `false`; only the store's
+/// `confirm_mfa_enrollment` ever flips it.
+#[derive(Clone)]
 pub struct NewUser {
     pub user_id: String,
     pub email: String,
     pub password_hash: String,
+    pub mfa_secret: Vec<u8>,
 }

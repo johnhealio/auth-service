@@ -10,6 +10,7 @@ pub mod auth;
 pub mod dpop;
 pub mod error;
 pub mod login;
+pub mod logout;
 pub mod password;
 pub mod random;
 pub mod rate_limit;
@@ -19,10 +20,11 @@ pub mod register;
 pub mod security_headers;
 pub mod store;
 pub mod token;
+pub mod totp;
 pub mod user;
 
 use dpop::PublicBaseUrl;
-use store::{DpopReplayStore, LoginAttemptStore, RefreshTokenStore, UserStore};
+use store::{DpopReplayStore, LoginAttemptStore, RecoveryCodeStore, RefreshTokenStore, UserStore};
 use token::JwtKeys;
 
 #[derive(Clone)]
@@ -31,6 +33,7 @@ pub struct AppState {
     pub refresh_store: Arc<dyn RefreshTokenStore>,
     pub dpop_replay: Arc<dyn DpopReplayStore>,
     pub login_attempts: Arc<dyn LoginAttemptStore>,
+    pub recovery_codes: Arc<dyn RecoveryCodeStore>,
     pub jwt: Arc<JwtKeys>,
     pub public_base_url: PublicBaseUrl,
 }
@@ -56,6 +59,12 @@ impl FromRef<AppState> for Arc<dyn DpopReplayStore> {
 impl FromRef<AppState> for Arc<dyn LoginAttemptStore> {
     fn from_ref(state: &AppState) -> Self {
         state.login_attempts.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<dyn RecoveryCodeStore> {
+    fn from_ref(state: &AppState) -> Self {
+        state.recovery_codes.clone()
     }
 }
 
@@ -93,6 +102,15 @@ pub fn app(state: AppState) -> Router {
             ),
         )
         .route(
+            "/register/confirm",
+            // Reuses register_config()'s bucket/limits — a continuation
+            // of the same registration flow, not a new abuse surface.
+            post(register::register_confirm_handler).layer(
+                GovernorLayer::new(rate_limit::register_config())
+                    .error_handler(rate_limit::rate_limit_error_handler),
+            ),
+        )
+        .route(
             "/login",
             post(login::login_handler).layer(
                 GovernorLayer::new(rate_limit::login_config())
@@ -103,6 +121,13 @@ pub fn app(state: AppState) -> Router {
             "/refresh",
             post(refresh::refresh_handler).layer(
                 GovernorLayer::new(rate_limit::refresh_config())
+                    .error_handler(rate_limit::rate_limit_error_handler),
+            ),
+        )
+        .route(
+            "/logout",
+            post(logout::logout_handler).layer(
+                GovernorLayer::new(rate_limit::logout_config())
                     .error_handler(rate_limit::rate_limit_error_handler),
             ),
         )

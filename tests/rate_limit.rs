@@ -43,7 +43,8 @@ async fn post_login(app: Router, email: &str) -> (StatusCode, Value) {
                 .body(Body::from(
                     serde_json::to_vec(&serde_json::json!({
                         "email": email,
-                        "password": "whatever password"
+                        "password": "whatever password",
+                        "mfa_code": "000000"
                     }))
                     .unwrap(),
                 ))

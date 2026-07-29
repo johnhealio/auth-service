@@ -8,10 +8,12 @@ use tracing_subscriber::EnvFilter;
 use auth_service::AppState;
 use auth_service::dpop::PublicBaseUrl;
 use auth_service::store::firestore::{
-    FirestoreDpopReplayStore, FirestoreLoginAttemptStore, FirestoreRefreshTokenStore,
-    FirestoreUserStore,
+    FirestoreDpopReplayStore, FirestoreLoginAttemptStore, FirestoreRecoveryCodeStore,
+    FirestoreRefreshTokenStore, FirestoreUserStore,
 };
-use auth_service::store::{DpopReplayStore, LoginAttemptStore, RefreshTokenStore, UserStore};
+use auth_service::store::{
+    DpopReplayStore, LoginAttemptStore, RecoveryCodeStore, RefreshTokenStore, UserStore,
+};
 use auth_service::token::JwtKeys;
 
 #[tokio::main]
@@ -41,7 +43,9 @@ async fn main() {
     let refresh_store: Arc<dyn RefreshTokenStore> =
         Arc::new(FirestoreRefreshTokenStore::new(db.clone()));
     let dpop_replay: Arc<dyn DpopReplayStore> = Arc::new(FirestoreDpopReplayStore::new(db.clone()));
-    let login_attempts: Arc<dyn LoginAttemptStore> = Arc::new(FirestoreLoginAttemptStore::new(db));
+    let login_attempts: Arc<dyn LoginAttemptStore> =
+        Arc::new(FirestoreLoginAttemptStore::new(db.clone()));
+    let recovery_codes: Arc<dyn RecoveryCodeStore> = Arc::new(FirestoreRecoveryCodeStore::new(db));
     let jwt = Arc::new(JwtKeys::from_env());
     let public_base_url = PublicBaseUrl::from_env();
 
@@ -50,6 +54,7 @@ async fn main() {
         refresh_store,
         dpop_replay,
         login_attempts,
+        recovery_codes,
         jwt,
         public_base_url,
     };

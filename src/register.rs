@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppJson, error_response, internal_error};
 use crate::password;
-use crate::random::generate_opaque_token;
+use crate::random::{generate_opaque_token, hash_token};
 use crate::store::{StoreError, UserStore};
+use crate::totp;
 use crate::user::NewUser;
 
 // Raised from NIST 800-63B's 8-char floor: the standard stronger default
@@ -18,6 +19,11 @@ use crate::user::NewUser;
 // so "strong password" is enforced, not just assumed.
 const MIN_PASSWORD_LEN: usize = 12;
 const MAX_PASSWORD_LEN: usize = 256;
+
+// Module 11: mandatory MFA. 10 single-use recovery codes are generated at
+// confirm time, shown exactly once, never retrievable again.
+const RECOVERY_CODE_COUNT: usize = 10;
+const RECOVERY_CODE_BYTE_LEN: usize = 5; // -> 10 hex chars, grouped "abcde-fghij"
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
@@ -29,6 +35,23 @@ pub struct RegisterRequest {
 pub struct RegisterResponse {
     pub email: String,
     pub created_at: DateTime<Utc>,
+    /// `otpauth://` URL — scan or paste into an authenticator app.
+    pub mfa_enrollment_url: String,
+    /// Base32 secret, for manual entry when a QR code isn't practical.
+    pub mfa_secret_base32: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConfirmRequest {
+    pub email: String,
+    pub mfa_code: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConfirmResponse {
+    pub email: String,
+    /// Plaintext, shown exactly once — never retrievable again.
+    pub recovery_codes: Vec<String>,
 }
 
 pub async fn register_handler(
@@ -69,11 +92,14 @@ pub async fn register_handler(
         }
     };
 
+    let enrollment = totp::generate_enrollment_secret(&email);
+
     match store
         .create_user(NewUser {
             user_id: generate_opaque_token(16),
             email,
             password_hash,
+            mfa_secret: enrollment.secret_bytes(),
         })
         .await
     {
@@ -82,6 +108,8 @@ pub async fn register_handler(
             Json(RegisterResponse {
                 email: user.email,
                 created_at: user.created_at,
+                mfa_enrollment_url: enrollment.otpauth_url(),
+                mfa_secret_base32: enrollment.base32_secret(),
             }),
         )
             .into_response(),
@@ -103,6 +131,79 @@ pub async fn register_handler(
             internal_error("failed to process registration")
         }
     }
+}
+
+/// Step two of the mandatory-MFA ceremony (Module 11): an account created
+/// by `register_handler` isn't usable for login until this succeeds. On
+/// success, generates and returns the account's recovery codes exactly
+/// once.
+pub async fn register_confirm_handler(
+    State(store): State<Arc<dyn UserStore>>,
+    AppJson(request): AppJson<ConfirmRequest>,
+) -> Response {
+    let email = request.email.trim().to_lowercase();
+
+    let user = match store.find_by_email(&email).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return invalid_confirmation_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "firestore backend error during confirm lookup");
+            return internal_error("failed to process confirmation");
+        }
+    };
+
+    // Generic response for "already enrolled", "wrong code", and
+    // "unknown email" alike — no reason to distinguish them to the caller.
+    if user.mfa_enrolled || !totp::check_code(&user.mfa_secret, &email, &request.mfa_code) {
+        return invalid_confirmation_response();
+    }
+
+    let plaintext_codes: Vec<String> = (0..RECOVERY_CODE_COUNT)
+        .map(|_| format_recovery_code(&generate_opaque_token(RECOVERY_CODE_BYTE_LEN)))
+        .collect();
+    let hashes: Vec<String> = plaintext_codes
+        .iter()
+        .map(|code| hash_token(code))
+        .collect();
+
+    match store.confirm_mfa_enrollment(&email, hashes).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ConfirmResponse {
+                email,
+                recovery_codes: plaintext_codes,
+            }),
+        )
+            .into_response(),
+        Err(StoreError::MfaAlreadyEnrolled) | Err(StoreError::NotFound) => {
+            invalid_confirmation_response()
+        }
+        Err(StoreError::Backend(err)) => {
+            tracing::error!(error = %err, "firestore backend error during confirm");
+            internal_error("failed to process confirmation")
+        }
+        Err(other) => {
+            tracing::error!(error = %other, "unexpected StoreError from confirm_mfa_enrollment");
+            internal_error("failed to process confirmation")
+        }
+    }
+}
+
+fn invalid_confirmation_response() -> Response {
+    error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid_confirmation",
+        "invalid email or MFA code",
+    )
+}
+
+fn format_recovery_code(raw_hex: &str) -> String {
+    raw_hex
+        .as_bytes()
+        .chunks(5)
+        .map(|chunk| std::str::from_utf8(chunk).expect("hex is ASCII"))
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 fn validate_email(email: &str) -> Result<(), String> {
