@@ -34,27 +34,33 @@ separate decisions made in sequence.
   emulator; this sandbox has no Java to run it
 
 ## Status
-Modules 1–9 complete (tags `v0.1.0` = Modules 1–2, `v0.2.0` = Module 3,
+Modules 1–10 complete (tags `v0.1.0` = Modules 1–2, `v0.2.0` = Module 3,
 `v0.3.0` = Module 4, `v0.4.0` = Module 6, `v0.5.0` = Module 7, `v0.6.0` =
-Module 8). Module 4 absorbed the original Module 5 scope ("protected
-route middleware, bearer-only, pre-DPoP") — `GET /me` and the `AuthUser`
-bearer extractor were built then rather than deferred. Module 6 (DPoP
-proof-of-possession) made DPoP mandatory at login and on `/me`. Module 7
-(DPoP-bound refresh rotation) enforced the `jkt` binding stored since
-Module 6, rotating on every use and detecting/revoking reused tokens —
-the last module with a roadmap-flagged pause point. Module 8 (Terraform +
-Cloud Run) provides the Dockerfile and `terraform/production/` IaC;
-Docker and Terraform were subsequently installed on this VM for local
-image builds/testing, but `docker push`/`terraform apply` against GCP are
-still deliberately laptop-only (the VM's own identity has zero IAM
-permissions by design — see Module 3's dev-bootstrap decision), so actual
-deployment still hasn't happened as of this commit. Module 9 (local dev
-polish) consolidated the four handlers' duplicated JSON error-building
-into one shared module (closing a real gap: malformed JSON bodies now get
-this app's error shape instead of axum's default), added `.env` support,
-a single-service `docker-compose.yml`, real `README.md` setup docs, and
-an `examples/cli.rs` reference client. Next: Module 10 (hardening pass),
-or actually executing Module 8's deployment from a privileged laptop.
+Module 8, `v0.7.0` = Module 9). Module 4 absorbed the original Module 5
+scope ("protected route middleware, bearer-only, pre-DPoP") — `GET /me`
+and the `AuthUser` bearer extractor were built then rather than deferred.
+Module 6 (DPoP proof-of-possession) made DPoP mandatory at login and on
+`/me`. Module 7 (DPoP-bound refresh rotation) enforced the `jkt` binding
+stored since Module 6, rotating on every use and detecting/revoking
+reused tokens — the last module with a roadmap-flagged pause point.
+Module 8 (Terraform + Cloud Run) provides the Dockerfile and
+`terraform/production/` IaC; Docker and Terraform were subsequently
+installed on this VM for local image builds/testing, but `docker
+push`/`terraform apply` against GCP are still deliberately laptop-only
+(the VM's own identity has zero IAM permissions by design — see Module
+3's dev-bootstrap decision), so actual deployment still hasn't happened
+as of this commit. Module 9 (local dev polish) consolidated the four
+handlers' duplicated JSON error-building into one shared module (closing
+a real gap: malformed JSON bodies now get this app's error shape instead
+of axum's default), added `.env` support, a single-service
+`docker-compose.yml`, real `README.md` setup docs, and an
+`examples/cli.rs` reference client. Module 10 (hardening pass) resolved
+the "no rate limiting exists yet" gap flagged since Module 3 — IP-based
+rate limiting on `/register`/`/login`/`/refresh` with a custom
+Cloud-Run-correct key extractor, a separate per-account login lockout,
+global security response headers, and a scheduled GitHub Actions
+dependency audit (this repo's first CI). Next: actually executing Module
+8's deployment from a privileged laptop, or further hardening.
 
 ## Decisions made so far
 
@@ -450,6 +456,90 @@ regular `[[bin]]` target. Run via `cargo run --example cli -- <command>`.
 Session state (tokens + the DPoP private key, which must stay the same
 key across `login`→`refresh`/`me` since proofs are bound to it) persists
 to `.auth-cli-state.json` in the working directory, gitignored.
+
+### Module 10: Rate limiting — in-memory per-instance, custom Cloud-Run-correct key extractor
+`governor`/`tower_governor`, applied only to `/register`/`/login`/`/refresh`
+(not `/healthz`/`/me`) via per-route `GovernorLayer`s built fresh inside
+`app()` — never a module-level `static`, both for correct per-Cloud-Run-
+instance semantics and because every test in this crate rebuilds `app()`
+per HTTP call, giving each call an independent bucket (no test pollution).
+In-memory, not Firestore-backed: accepts ~3x effective budget across Cloud
+Run's max 3 instances (Module 8) rather than pay a transactional Firestore
+read+write on every single request on these routes — confirmed with the
+user, consistent with Module 8's own Cloud Run scaling reasoning.
+**Correctness finding**: `tower_governor`'s built-in `SmartIpKeyExtractor`
+trusts the *first* entry in `X-Forwarded-For`, which is fully
+attacker-controlled (a client can prepend any fake value before the
+request reaches Cloud Run). Google Cloud's own docs confirm Cloud Run's
+front end always *appends* exactly two trustworthy entries at the
+**end** — `<client-ip>,<load-balancer-ip>` — regardless of what a client
+sends. `CloudRunKeyExtractor` (`src/rate_limit.rs`) reads the
+second-to-last entry instead, falling back to `ConnectInfo<SocketAddr>`
+(only populated via `into_make_service_with_connect_info`, `src/main.rs`)
+for non-Cloud-Run contexts, and fails *open* into one shared bucket
+(rather than erroring the request) when neither is present — true for
+every test, which drive the router via `oneshot` with no real listener.
+`register`/`login`/`refresh` get different burst/refill numbers (5, 20,
+20 burst respectively) reflecting each route's abuse shape; `login`'s
+burst is deliberately well above the account-lockout threshold below (20
+vs. 10) — if they were equal, the coarser IP limiter would always
+intercept the request that should have triggered the precise per-account
+lockout, since the rate-limit middleware runs before the handler.
+tower_governor's own 429 body is plain text, not this app's JSON error
+shape — normalized via `GovernorLayer::error_handler`.
+
+### Module 10: Login brute-force lockout — separate from IP rate limiting, symmetric by design
+Per-normalized-email Firestore-backed counter (`login_attempts`
+collection, `src/store/firestore.rs`), using the transactional
+read-then-conditionally-write pattern `rotate()` established in Module 7
+(Firestore write preconditions only support `Exists(bool)`, not
+field-value conditions) — not `DpopReplayStore`'s insert-once pattern,
+which doesn't fit a counter needing repeated increments.
+`LOGIN_FAILURE_THRESHOLD = 10` within a 15-minute window, then a
+15-minute lockout; attempts during an active lockout don't extend it
+(an attacker guessing shouldn't be able to keep locking a real user out
+indefinitely). **Enumeration-safety constraint**: Module 4's timing-safe
+login collapses "wrong password on a real account" and "no such account"
+into one identical branch, paying the same Argon2 cost either way via
+`DUMMY_HASH`. A lockout counter created only for real accounts would
+reintroduce exactly that side channel — so `record_failure` increments
+unconditionally for whatever email was submitted, real or not, mirroring
+`DUMMY_HASH`'s "same cost, same code path either way" philosophy. A
+distinct `account_locked` response (vs. generic `invalid_credentials`) is
+safe specifically *because* the increment is symmetric: it reveals "N
+failed attempts against this email string," not whether the email is
+real. Successful login resets the counter (Firestore delete, not
+update-to-zero — "no doc" is already the correct state for a clean
+account). One real implementation gotcha hit and fixed: the `firestore`
+crate's document serializer omits `None`-valued `Option` fields entirely
+rather than writing an explicit null, so `locked_until: Option<DateTime<Utc>>`
+needed `#[serde(default)]` alongside its timestamp `with` module, or
+reading back a record created while unlocked would fail deserialization
+("missing field") instead of yielding `None`.
+
+### Module 10: Security response headers — global, `axum::middleware::from_fn`
+`X-Content-Type-Options: nosniff`, `Cache-Control: no-store` (the load-
+bearing one — `/login`/`/refresh` responses carry bearer tokens in the
+JSON body, and `no-store` is the strongest directive against any
+intermediary caching them), `Referrer-Policy: no-referrer`, and
+`Strict-Transport-Security`. Applied to every route including
+`/healthz`/`/me`, unlike the route-scoped rate limiter — headers don't
+need scoping, and a plain `middleware::from_fn` avoided adding a new
+`tower-http` feature for a four-header fixed list. HSTS included despite
+this project's stated "Client type: backend/CLI and native app client"
+(not a browser, so HSTS's browser-enforced mechanism has lower value
+here) — free for non-browser clients, cheap defense-in-depth if a browser
+client ever appears.
+
+### Module 10: Dependency audit — scheduled GitHub Actions workflow (first CI in this repo)
+`.github/workflows/audit.yml`: `rustsec/audit-check@v2.0.0` on push to
+`main` and a weekly cron, plus manual `workflow_dispatch`. Confirmed with
+the user over a documented-command-only alternative: a scheduled job
+catches newly-disclosed CVEs against an unchanged `Cargo.lock`, which a
+manual command only run "when someone thinks to" would miss. Deliberately
+minimal — no build/test job, no matrix — not the general CI/Cloud Build
+pipeline Module 8 explicitly deferred; `rustsec/audit-check` installs
+`cargo-audit` itself, so nothing was added to `Cargo.toml`.
 
 ## Constraints
 - No secrets or credentials ever committed to the repo or written into code.

@@ -91,3 +91,28 @@ pub trait DpopReplayStore: Send + Sync {
     /// race under concurrent requests.
     async fn insert_jti(&self, jti: &str, expires_at: DateTime<Utc>) -> Result<(), StoreError>;
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginAttemptState {
+    Allowed,
+    Locked { retry_after: DateTime<Utc> },
+}
+
+#[async_trait]
+pub trait LoginAttemptStore: Send + Sync {
+    /// Read-only lockout check, called before credential verification.
+    async fn check(&self, normalized_email: &str) -> Result<LoginAttemptState, StoreError>;
+
+    /// Records a failed login attempt for `normalized_email`, whatever
+    /// was submitted — regardless of whether a `users` document exists
+    /// for it. Must stay symmetric with `login::DUMMY_HASH`'s "same
+    /// cost/same code path either way" posture, or lockout state itself
+    /// becomes an account-enumeration side channel. Returns the
+    /// resulting lockout state.
+    async fn record_failure(&self, normalized_email: &str)
+    -> Result<LoginAttemptState, StoreError>;
+
+    /// Clears accumulated failure history after a successful login, so
+    /// occasional typos don't eventually lock out a legitimate user.
+    async fn reset(&self, normalized_email: &str) -> Result<(), StoreError>;
+}

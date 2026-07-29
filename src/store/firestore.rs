@@ -11,12 +11,24 @@ use crate::refresh_token::{
     ABSOLUTE_SESSION_CAP_DAYS, NewRefreshToken, REFRESH_TOKEN_TTL_DAYS, RefreshTokenRecord,
     RefreshTokenStatus,
 };
-use crate::store::{DpopReplayStore, RefreshTokenStore, StoreError, UserStore};
+use crate::store::{
+    DpopReplayStore, LoginAttemptState, LoginAttemptStore, RefreshTokenStore, StoreError, UserStore,
+};
 use crate::user::{NewUser, User};
 
 const USERS_COLLECTION: &str = "users";
 const REFRESH_TOKENS_COLLECTION: &str = "refresh_tokens";
 const DPOP_JTI_COLLECTION: &str = "dpop_jti";
+const LOGIN_ATTEMPTS_COLLECTION: &str = "login_attempts";
+
+// OWASP-baseline-style lockout, same framing as Module 3's Argon2
+// baseline: lenient enough not to lock out a user hitting a few typos,
+// tight enough to blunt sustained per-account guessing that the IP-based
+// rate limiter alone doesn't cover (a distributed attacker spreads
+// guesses across many source IPs against one target account).
+pub const LOGIN_FAILURE_THRESHOLD: u32 = 10;
+pub const LOGIN_ATTEMPT_WINDOW_MINUTES: i64 = 15;
+pub const LOGIN_LOCKOUT_MINUTES: i64 = 15;
 
 pub struct FirestoreUserStore {
     db: FirestoreDb,
@@ -324,5 +336,155 @@ impl DpopReplayStore for FirestoreDpopReplayStore {
             })?;
 
         Ok(())
+    }
+}
+
+/// Firestore document shape for `login_attempts/{normalized_email}` — the
+/// doc ID is the *submitted* normalized email, whether or not a `users`
+/// document exists for it (see Module 10 notes on `LoginAttemptStore`:
+/// this must stay symmetric between real and fake accounts, or lockout
+/// state itself becomes an account-enumeration side channel). No active
+/// TTL cleanup yet, same accepted posture as `DpopJtiRecord`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LoginAttemptRecord {
+    failure_count: u32,
+    #[serde(with = "firestore::serialize_as_timestamp")]
+    window_started_at: DateTime<Utc>,
+    // `#[serde(default)]` matters here: the firestore crate's document
+    // serializer omits `None`-valued fields entirely rather than writing
+    // an explicit null, so a record created while `locked_until` is
+    // `None` has no such field on read-back at all — without `default`,
+    // that's a deserialization error, not a `None`.
+    #[serde(default, with = "firestore::serialize_as_optional_timestamp")]
+    locked_until: Option<DateTime<Utc>>,
+}
+
+fn login_attempt_state(record: &LoginAttemptRecord, now: DateTime<Utc>) -> LoginAttemptState {
+    match record.locked_until {
+        Some(until) if until > now => LoginAttemptState::Locked { retry_after: until },
+        _ => LoginAttemptState::Allowed,
+    }
+}
+
+pub struct FirestoreLoginAttemptStore {
+    db: FirestoreDb,
+}
+
+impl FirestoreLoginAttemptStore {
+    pub fn new(db: FirestoreDb) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl LoginAttemptStore for FirestoreLoginAttemptStore {
+    async fn check(&self, normalized_email: &str) -> Result<LoginAttemptState, StoreError> {
+        let record = self
+            .db
+            .fluent()
+            .select()
+            .by_id_in(LOGIN_ATTEMPTS_COLLECTION)
+            .obj::<LoginAttemptRecord>()
+            .one(normalized_email)
+            .await
+            .map_err(|err| StoreError::Backend(err.to_string()))?;
+
+        Ok(record.map_or(LoginAttemptState::Allowed, |r| {
+            login_attempt_state(&r, Utc::now())
+        }))
+    }
+
+    async fn record_failure(
+        &self,
+        normalized_email: &str,
+    ) -> Result<LoginAttemptState, StoreError> {
+        let key = normalized_email.to_string();
+
+        let record = self
+            .db
+            .run_transaction(move |tx_db, tx| {
+                let key = key.clone();
+                Box::pin(async move {
+                    let now = Utc::now();
+                    let current = tx_db
+                        .fluent()
+                        .select()
+                        .by_id_in(LOGIN_ATTEMPTS_COLLECTION)
+                        .obj::<LoginAttemptRecord>()
+                        .one(&key)
+                        .await?;
+
+                    let (next, precondition) = match current {
+                        None => (
+                            LoginAttemptRecord {
+                                failure_count: 1,
+                                window_started_at: now,
+                                locked_until: None,
+                            },
+                            FirestoreWritePrecondition::Exists(false),
+                        ),
+                        Some(existing) => {
+                            let still_locked =
+                                existing.locked_until.is_some_and(|until| until > now);
+                            let window_expired = now - existing.window_started_at
+                                > Duration::minutes(LOGIN_ATTEMPT_WINDOW_MINUTES);
+
+                            let next = if still_locked {
+                                // Don't extend the lockout on every
+                                // additional attempt during it — an
+                                // attacker shouldn't be able to keep a
+                                // real user locked out indefinitely just
+                                // by continuing to guess.
+                                existing
+                            } else if window_expired {
+                                LoginAttemptRecord {
+                                    failure_count: 1,
+                                    window_started_at: now,
+                                    locked_until: None,
+                                }
+                            } else {
+                                let failure_count = existing.failure_count + 1;
+                                let locked_until = (failure_count >= LOGIN_FAILURE_THRESHOLD)
+                                    .then(|| now + Duration::minutes(LOGIN_LOCKOUT_MINUTES));
+                                LoginAttemptRecord {
+                                    failure_count,
+                                    window_started_at: existing.window_started_at,
+                                    locked_until,
+                                }
+                            };
+                            (next, FirestoreWritePrecondition::Exists(true))
+                        }
+                    };
+
+                    tx_db
+                        .fluent()
+                        .update()
+                        .in_col(LOGIN_ATTEMPTS_COLLECTION)
+                        .precondition(precondition)
+                        .document_id(&key)
+                        .object(&next)
+                        .add_to_transaction(tx)?;
+
+                    Ok(next)
+                })
+            })
+            .await
+            .map_err(|err| StoreError::Backend(err.to_string()))?;
+
+        Ok(login_attempt_state(&record, Utc::now()))
+    }
+
+    async fn reset(&self, normalized_email: &str) -> Result<(), StoreError> {
+        // Delete rather than update-to-zero: "no doc" is also correct
+        // for an email that's never failed a login. Idempotent — no
+        // error if no doc exists (mirrors a clean-history account).
+        self.db
+            .fluent()
+            .delete()
+            .from(LOGIN_ATTEMPTS_COLLECTION)
+            .document_id(normalized_email)
+            .execute()
+            .await
+            .map_err(|err| StoreError::Backend(err.to_string()))
     }
 }

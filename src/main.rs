@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use firestore::{FirestoreDb, FirestoreDbOptions};
@@ -7,9 +8,10 @@ use tracing_subscriber::EnvFilter;
 use auth_service::AppState;
 use auth_service::dpop::PublicBaseUrl;
 use auth_service::store::firestore::{
-    FirestoreDpopReplayStore, FirestoreRefreshTokenStore, FirestoreUserStore,
+    FirestoreDpopReplayStore, FirestoreLoginAttemptStore, FirestoreRefreshTokenStore,
+    FirestoreUserStore,
 };
-use auth_service::store::{DpopReplayStore, RefreshTokenStore, UserStore};
+use auth_service::store::{DpopReplayStore, LoginAttemptStore, RefreshTokenStore, UserStore};
 use auth_service::token::JwtKeys;
 
 #[tokio::main]
@@ -38,7 +40,8 @@ async fn main() {
     let store: Arc<dyn UserStore> = Arc::new(FirestoreUserStore::new(db.clone()));
     let refresh_store: Arc<dyn RefreshTokenStore> =
         Arc::new(FirestoreRefreshTokenStore::new(db.clone()));
-    let dpop_replay: Arc<dyn DpopReplayStore> = Arc::new(FirestoreDpopReplayStore::new(db));
+    let dpop_replay: Arc<dyn DpopReplayStore> = Arc::new(FirestoreDpopReplayStore::new(db.clone()));
+    let login_attempts: Arc<dyn LoginAttemptStore> = Arc::new(FirestoreLoginAttemptStore::new(db));
     let jwt = Arc::new(JwtKeys::from_env());
     let public_base_url = PublicBaseUrl::from_env();
 
@@ -46,6 +49,7 @@ async fn main() {
         store,
         refresh_store,
         dpop_replay,
+        login_attempts,
         jwt,
         public_base_url,
     };
@@ -56,7 +60,14 @@ async fn main() {
         .expect("failed to bind address");
     tracing::info!(%addr, "auth-service listening");
 
-    axum::serve(listener, auth_service::app(state))
-        .await
-        .expect("server error");
+    // into_make_service_with_connect_info is required for the rate
+    // limiter's ConnectInfo fallback to ever populate (see
+    // rate_limit::CloudRunKeyExtractor) — plain axum::serve never
+    // injects ConnectInfo into request extensions.
+    axum::serve(
+        listener,
+        auth_service::app(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .expect("server error");
 }

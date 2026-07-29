@@ -11,7 +11,9 @@ use crate::error::{AppJson, dpop_error_response, error_response};
 use crate::password;
 use crate::random::{generate_opaque_token, hash_token};
 use crate::refresh_token::NewRefreshToken;
-use crate::store::{DpopReplayStore, RefreshTokenStore, UserStore};
+use crate::store::{
+    DpopReplayStore, LoginAttemptState, LoginAttemptStore, RefreshTokenStore, UserStore,
+};
 use crate::token::JwtKeys;
 
 // Paid on every login where the account doesn't exist, so that path costs
@@ -47,6 +49,7 @@ pub async fn login_handler(
     State(store): State<Arc<dyn UserStore>>,
     State(refresh_store): State<Arc<dyn RefreshTokenStore>>,
     State(dpop_replay): State<Arc<dyn DpopReplayStore>>,
+    State(login_attempts): State<Arc<dyn LoginAttemptStore>>,
     State(jwt): State<Arc<JwtKeys>>,
     State(base_url): State<PublicBaseUrl>,
     method: Method,
@@ -55,6 +58,21 @@ pub async fn login_handler(
     AppJson(request): AppJson<LoginRequest>,
 ) -> Response {
     let email = request.email.trim().to_lowercase();
+
+    // Checked before any Argon2 work, using the *submitted* email string
+    // unconditionally — same enumeration-safety requirement as
+    // DUMMY_HASH below: must not distinguish real accounts from fake
+    // ones.
+    match login_attempts.check(&email).await {
+        Ok(LoginAttemptState::Locked { retry_after }) => {
+            return account_locked_response(retry_after);
+        }
+        Ok(LoginAttemptState::Allowed) => {}
+        Err(err) => {
+            tracing::error!(error = %err, "firestore backend error during lockout check");
+            return internal_error();
+        }
+    }
 
     let user = match store.find_by_email(&email).await {
         Ok(user) => user,
@@ -78,12 +96,25 @@ pub async fn login_handler(
     };
 
     let Some(user) = user.filter(|_| verified) else {
+        // Recorded unconditionally, whether or not `email` is a real
+        // account — the increment itself must stay symmetric, or lockout
+        // state becomes an enumeration side channel.
+        if let Err(err) = login_attempts.record_failure(&email).await {
+            tracing::error!(error = %err, "failed to record login failure");
+            // Fail open: a lockout-bookkeeping error shouldn't block the
+            // (already-decided) generic rejection response.
+        }
         return error_response(
             StatusCode::UNAUTHORIZED,
             "invalid_credentials",
             "invalid email or password",
         );
     };
+
+    if let Err(err) = login_attempts.reset(&email).await {
+        tracing::error!(error = %err, "failed to reset login attempt counter");
+        // Not fatal to the login itself.
+    }
 
     // Validated only after credentials succeed: a bad DPoP proof on a
     // doomed-anyway login attempt shouldn't get a different error path or
@@ -143,4 +174,17 @@ pub async fn login_handler(
 
 fn internal_error() -> Response {
     crate::error::internal_error("failed to process login")
+}
+
+fn account_locked_response(retry_after: chrono::DateTime<chrono::Utc>) -> Response {
+    let retry_after_secs = (retry_after - chrono::Utc::now()).num_seconds().max(0);
+    let mut response = error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "account_locked",
+        "too many failed login attempts; try again later",
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after_secs.to_string()) {
+        response.headers_mut().insert("retry-after", value);
+    }
+    response
 }

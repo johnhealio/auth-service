@@ -1,6 +1,6 @@
 [package]
 name = "auth-service"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 
 [dependencies]
@@ -11,6 +11,7 @@ base64 = "0.23.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 dotenvy = "0.15.7"
 firestore = { version = "0.50.0", default-features = false, features = ["tls-webpki-roots"] }
+governor = "0.10.4"
 jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 reqwest = { version = "0.13.4", features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -19,6 +20,7 @@ sha1 = "0.11.0"
 sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["full"] }
 tower-http = { version = "0.7.0", features = ["trace"] }
+tower_governor = { version = "0.8.0", default-features = false, features = ["axum", "tracing"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"

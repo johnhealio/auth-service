@@ -7,9 +7,10 @@ use auth_service::dpop::PublicBaseUrl;
 use auth_service::random::{generate_opaque_token, hash_token};
 use auth_service::refresh_token::{RefreshTokenRecord, RefreshTokenStatus};
 use auth_service::store::firestore::{
-    FirestoreDpopReplayStore, FirestoreRefreshTokenStore, FirestoreUserStore,
+    FirestoreDpopReplayStore, FirestoreLoginAttemptStore, FirestoreRefreshTokenStore,
+    FirestoreUserStore,
 };
-use auth_service::store::{DpopReplayStore, RefreshTokenStore, UserStore};
+use auth_service::store::{DpopReplayStore, LoginAttemptStore, RefreshTokenStore, UserStore};
 use auth_service::token::JwtKeys;
 use auth_service::user::{NewUser, User};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -49,7 +50,8 @@ pub async fn test_app_state() -> AppState {
     let store: Arc<dyn UserStore> = Arc::new(FirestoreUserStore::new(db.clone()));
     let refresh_store: Arc<dyn RefreshTokenStore> =
         Arc::new(FirestoreRefreshTokenStore::new(db.clone()));
-    let dpop_replay: Arc<dyn DpopReplayStore> = Arc::new(FirestoreDpopReplayStore::new(db));
+    let dpop_replay: Arc<dyn DpopReplayStore> = Arc::new(FirestoreDpopReplayStore::new(db.clone()));
+    let login_attempts: Arc<dyn LoginAttemptStore> = Arc::new(FirestoreLoginAttemptStore::new(db));
     let jwt = Arc::new(JwtKeys::new(
         TEST_JWT_SIGNING_SECRET,
         Duration::from_secs(600),
@@ -60,6 +62,7 @@ pub async fn test_app_state() -> AppState {
         store,
         refresh_store,
         dpop_replay,
+        login_attempts,
         jwt,
         public_base_url,
     }
