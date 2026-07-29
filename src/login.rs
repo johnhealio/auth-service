@@ -5,9 +5,9 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 use crate::dpop::{self, DpopError, PublicBaseUrl};
+use crate::error::{AppJson, dpop_error_response, error_response};
 use crate::password;
 use crate::random::{generate_opaque_token, hash_token};
 use crate::refresh_token::NewRefreshToken;
@@ -52,7 +52,7 @@ pub async fn login_handler(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    Json(request): Json<LoginRequest>,
+    AppJson(request): AppJson<LoginRequest>,
 ) -> Response {
     let email = request.email.trim().to_lowercase();
 
@@ -142,17 +142,5 @@ pub async fn login_handler(
 }
 
 fn internal_error() -> Response {
-    error_response(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "internal_error",
-        "failed to process login",
-    )
-}
-
-fn error_response(status: StatusCode, error: &str, message: &str) -> Response {
-    (status, Json(json!({ "error": error, "message": message }))).into_response()
-}
-
-fn dpop_error_response(status: StatusCode, err: &DpopError) -> Response {
-    error_response(status, "invalid_dpop_proof", err.message())
+    crate::error::internal_error("failed to process login")
 }

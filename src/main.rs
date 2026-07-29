@@ -14,6 +14,11 @@ use auth_service::token::JwtKeys;
 
 #[tokio::main]
 async fn main() {
+    // No-op if missing (e.g. the deployed container, which gets its env
+    // from Cloud Run/Secret Manager, not a file). Real env vars always
+    // win — dotenvy never overwrites an already-set var.
+    let _ = dotenvy::dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

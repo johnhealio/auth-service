@@ -1,5 +1,11 @@
 /target
 
+# Local dev secrets — never committed, see .env.example
+.env
+
+# Example CLI's persisted session state (tokens + a DPoP private key)
+.auth-cli-state.json
+
 # Conversation exports from /export — not project source
 *.txt
 

@@ -75,13 +75,14 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "auth-service"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "argon2",
  "async-trait",
  "axum",
  "base64 0.23.0",
  "chrono",
+ "dotenvy",
  "firestore",
  "jsonwebtoken 11.0.0",
  "p256",
@@ -530,6 +531,12 @@ dependencies = [
  "quote",
  "syn 3.0.3",
 ]
+
+[[package]]
+name = "dotenvy"
+version = "0.15.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "dunce"

@@ -34,21 +34,27 @@ separate decisions made in sequence.
   emulator; this sandbox has no Java to run it
 
 ## Status
-Modules 1–8 complete (tags `v0.1.0` = Modules 1–2, `v0.2.0` = Module 3,
-`v0.3.0` = Module 4, `v0.4.0` = Module 6, `v0.5.0` = Module 7; Module 8 not
-yet tagged/deployed). Module 4 absorbed the original Module 5 scope
-("protected route middleware, bearer-only, pre-DPoP") — `GET /me` and the
-`AuthUser` bearer extractor were built then rather than deferred. Module 6
-(DPoP proof-of-possession) made DPoP mandatory at login and on `/me`.
-Module 7 (DPoP-bound refresh rotation) enforced the `jkt` binding stored
-since Module 6, rotating on every use and detecting/revoking reused tokens
-— the last module with a roadmap-flagged pause point. Module 8 (Terraform
-+ Cloud Run) provides the Dockerfile and `terraform/production/` IaC; the
-actual build/push/apply happens from the user's laptop (this sandbox has
-no Docker and its VM identity has no IAM permissions), so deployment
-itself is not yet done as of this commit. Next: Module 9 (local dev
-polish) or Module 10 (hardening pass).
-Terraform IaC + Cloud Run deployment.
+Modules 1–9 complete (tags `v0.1.0` = Modules 1–2, `v0.2.0` = Module 3,
+`v0.3.0` = Module 4, `v0.4.0` = Module 6, `v0.5.0` = Module 7, `v0.6.0` =
+Module 8). Module 4 absorbed the original Module 5 scope ("protected
+route middleware, bearer-only, pre-DPoP") — `GET /me` and the `AuthUser`
+bearer extractor were built then rather than deferred. Module 6 (DPoP
+proof-of-possession) made DPoP mandatory at login and on `/me`. Module 7
+(DPoP-bound refresh rotation) enforced the `jkt` binding stored since
+Module 6, rotating on every use and detecting/revoking reused tokens —
+the last module with a roadmap-flagged pause point. Module 8 (Terraform +
+Cloud Run) provides the Dockerfile and `terraform/production/` IaC;
+Docker and Terraform were subsequently installed on this VM for local
+image builds/testing, but `docker push`/`terraform apply` against GCP are
+still deliberately laptop-only (the VM's own identity has zero IAM
+permissions by design — see Module 3's dev-bootstrap decision), so actual
+deployment still hasn't happened as of this commit. Module 9 (local dev
+polish) consolidated the four handlers' duplicated JSON error-building
+into one shared module (closing a real gap: malformed JSON bodies now get
+this app's error shape instead of axum's default), added `.env` support,
+a single-service `docker-compose.yml`, real `README.md` setup docs, and
+an `examples/cli.rs` reference client. Next: Module 10 (hardening pass),
+or actually executing Module 8's deployment from a privileged laptop.
 
 ## Decisions made so far
 
@@ -379,6 +385,72 @@ cost/cold-start profile. Public invoker access (`allUsers`) is
 intentional — this is an auth service, registration/login must be
 reachable without pre-existing credentials.
 
+### Module 9: Shared error module, not a `StoreError → Response` mapping
+`src/error.rs` centralizes the JSON error shape (`{"error":..,"message":..}`)
+that `register.rs`/`login.rs`/`refresh.rs` had each independently
+duplicated (three copies of the same `error_response` helper) and
+`auth.rs` had hand-inlined twice. Callers still choose their own status
+code per call site — deliberately not unified — so the existing
+`invalid_dpop_proof` split (400 at `/login`/`/refresh`, 401 on `/me`,
+Module 6's timing-signal reasoning) survives untouched, and no test's
+`body["error"]` assertion changed. Did **not** add `impl IntoResponse for
+StoreError`: `register.rs` and `refresh.rs` map the same variants (e.g.
+a not-found-shaped case) to different codes/statuses in different
+contexts, so a shared mapping would be either lossy or just as much
+per-handler code as today — not worth it for a pure-polish module.
+
+### Module 9: `AppJson<T>` closes a real gap — malformed JSON bodies
+Before this, a malformed request body or wrong `Content-Type` on
+`/register`, `/login`, or `/refresh` skipped all app error-handling
+entirely and fell through to axum's own default `JsonRejection` response
+(plain text, not this app's shape) — untested, undiscovered until this
+module's duplication survey. `AppJson<T>` (`src/error.rs`) wraps
+`axum::Json<T>` as a drop-in `FromRequest` replacement, reusing
+`JsonRejection`'s own per-variant `.status()` (400 for a syntax error,
+415 for a wrong content-type, etc.) rather than hardcoding one status,
+under a new `invalid_json` error code. Axum 0.8's `FromRequest` is a
+native `async fn`-in-trait, so no `async_trait` macro needed (unlike this
+project's `dyn`-compatible store traits, which need it for object
+safety).
+
+### Module 9: `.env` via `dotenvy`, loaded before any `env::var` read
+`dotenvy::dotenv()` runs as the first line of `main()`, `.ok()`'d away
+(never fatal) since a missing `.env` is expected in the deployed
+container (env comes from Cloud Run/Secret Manager there, not a file) —
+and it never overwrites a var already set in the real environment, so
+shell exports still win. `tests/common/mod.rs` needed no change:
+`JWT_SIGNING_SECRET`/`PUBLIC_BASE_URL` were already fixed test-only
+constants there, bypassing `from_env()`, and `cargo test` never runs
+`main()`. `.env`/`.env.*` are covered by this repo's own
+`.claude/settings.json` deny rules (Read/Edit/Write all blocked) as a
+hardening measure — even `.env.example`, which holds only placeholders,
+had to be created by the user by hand rather than by Claude, since that
+policy makes no content-based exception.
+
+### Module 9: `docker-compose.yml` — single service, no healthcheck
+One service (the app container), `env_file: .env`; Firestore stays a
+real remote dependency reached over the network exactly as in plain
+`cargo run` — there's no local Firestore container to `depends_on`
+(Module 3's real-database-not-emulator decision). No `healthcheck:`
+block: the runtime image (Module 8's `debian:bookworm-slim` +
+`ca-certificates` only) has no `curl`/`wget`, and every Compose
+`healthcheck.test` variant execs a command inside the container — adding
+one would mean editing the Dockerfile, out of scope for this module.
+
+### Module 9: `examples/cli.rs` — reference DPoP client
+User-requested mid-module. A real client-side DPoP implementation (ES256
+keypair generation, JWK thumbprint, proof signing for `/login`,
+`/refresh`, and `/me`'s `ath`-bound proof), not a mock — demonstrating
+the protocol this project spent Modules 1/6/7 designing. Lives under
+`examples/`, not `src/bin/`, specifically so it can use `p256`/`pkcs8` as
+dev-dependencies (already pinned there for `tests/common/dpop.rs`'s
+proof-building) without adding them to the deployed service binary —
+Cargo only links dev-dependencies for tests/examples/benches, never a
+regular `[[bin]]` target. Run via `cargo run --example cli -- <command>`.
+Session state (tokens + the DPoP private key, which must stay the same
+key across `login`→`refresh`/`me` since proofs are bound to it) persists
+to `.auth-cli-state.json` in the working directory, gitignored.
+
 ## Constraints
 - No secrets or credentials ever committed to the repo or written into code.
 - Firestore access from the deployed service should use a dedicated service
@@ -393,4 +465,8 @@ reachable without pre-existing credentials.
 - Format: `cargo fmt`
 - Run locally: `FIRESTORE_PROJECT_ID=johnhealio-claude-code FIRESTORE_DATABASE_ID=auth-service-dev JWT_SIGNING_SECRET=$(openssl rand -hex 32) PUBLIC_BASE_URL=http://localhost:8080 cargo run`
   (`cargo test` only needs the two `FIRESTORE_*` vars — tests use a fixed
-  test-only signing secret and base URL, see `tests/common/mod.rs`)
+  test-only signing secret and base URL, see `tests/common/mod.rs`). As of
+  Module 9, `cp .env.example .env` + fill in values is equivalent — `cargo
+  run` loads `.env` automatically — or `docker compose up --build`.
+- Example CLI client: `cargo run --example cli -- register|login|refresh|me`
+  (see README.md)

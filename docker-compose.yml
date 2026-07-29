@@ -1,0 +1,10 @@
+services:
+  auth-service:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    # Firestore is always a real remote dependency reached over the
+    # network (see CLAUDE.md: "Local dev: real dev Firestore database") —
+    # there's no local Firestore container to depend_on here.

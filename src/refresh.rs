@@ -6,9 +6,9 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use serde::Deserialize;
-use serde_json::json;
 
 use crate::dpop::{self, DpopError, PublicBaseUrl};
+use crate::error::{AppJson, dpop_error_response, error_response};
 use crate::login::TokenResponse;
 use crate::random::{generate_opaque_token, hash_token};
 use crate::refresh_token::RefreshTokenStatus;
@@ -32,7 +32,7 @@ pub async fn refresh_handler(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    Json(request): Json<RefreshRequest>,
+    AppJson(request): AppJson<RefreshRequest>,
 ) -> Response {
     let token_hash = hash_token(&request.refresh_token);
 
@@ -140,11 +140,7 @@ pub async fn refresh_handler(
 }
 
 fn internal_error() -> Response {
-    error_response(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "internal_error",
-        "failed to process refresh",
-    )
+    crate::error::internal_error("failed to process refresh")
 }
 
 fn invalid_refresh_token_response() -> Response {
@@ -161,12 +157,4 @@ fn reused_refresh_token_response() -> Response {
         "refresh_token_reused",
         "this refresh token has already been used; your session has been revoked for security reasons, please log in again",
     )
-}
-
-fn error_response(status: StatusCode, error: &str, message: &str) -> Response {
-    (status, Json(json!({ "error": error, "message": message }))).into_response()
-}
-
-fn dpop_error_response(status: StatusCode, err: &DpopError) -> Response {
-    error_response(status, "invalid_dpop_proof", err.message())
 }

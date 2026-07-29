@@ -1,6 +1,9 @@
 /target
 .git
 .gitignore
+.env
+.auth-cli-state.json
+examples/
 terraform/
 *.tfstate
 *.tfstate.*

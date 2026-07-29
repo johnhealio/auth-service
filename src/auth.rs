@@ -8,6 +8,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
 use crate::dpop::{self, DpopError, PublicBaseUrl};
+use crate::error;
 use crate::store::DpopReplayStore;
 use crate::token::JwtKeys;
 
@@ -107,19 +108,11 @@ fn extract_bearer_token(parts: &Parts) -> Result<&str, Response> {
 }
 
 fn unauthorized() -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({ "error": "unauthorized", "message": "missing or invalid access token" })),
-    )
-        .into_response()
+    error::unauthorized()
 }
 
 fn dpop_error_response(err: &DpopError) -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({ "error": "invalid_dpop_proof", "message": err.message() })),
-    )
-        .into_response()
+    error::dpop_error_response(StatusCode::UNAUTHORIZED, err)
 }
 
 pub async fn me_handler(user: DpopBoundUser) -> Response {

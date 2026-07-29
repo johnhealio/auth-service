@@ -6,8 +6,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
+use crate::error::{AppJson, error_response, internal_error};
 use crate::password;
 use crate::random::generate_opaque_token;
 use crate::store::{StoreError, UserStore};
@@ -33,7 +33,7 @@ pub struct RegisterResponse {
 
 pub async fn register_handler(
     State(store): State<Arc<dyn UserStore>>,
-    Json(request): Json<RegisterRequest>,
+    AppJson(request): AppJson<RegisterRequest>,
 ) -> Response {
     let email = request.email.trim().to_lowercase();
 
@@ -65,11 +65,7 @@ pub async fn register_handler(
         Ok(hash) => hash,
         Err(err) => {
             tracing::error!(error = %err, "password hashing failed");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                "failed to process registration",
-            );
+            return internal_error("failed to process registration");
         }
     };
 
@@ -96,11 +92,7 @@ pub async fn register_handler(
         ),
         Err(StoreError::Backend(err)) => {
             tracing::error!(error = %err, "firestore backend error during registration");
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                "failed to process registration",
-            )
+            internal_error("failed to process registration")
         }
         Err(other) => {
             // Not real code paths for user creation — a UserStore never
@@ -108,11 +100,7 @@ pub async fn register_handler(
             // store traits, so match exhaustively rather than panic if one
             // ever did.
             tracing::error!(error = %other, "unexpected StoreError from create_user");
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                "failed to process registration",
-            )
+            internal_error("failed to process registration")
         }
     }
 }
@@ -143,8 +131,4 @@ fn validate_password(password: &str) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-fn error_response(status: StatusCode, error: &str, message: &str) -> Response {
-    (status, Json(json!({ "error": error, "message": message }))).into_response()
 }

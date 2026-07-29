@@ -7,6 +7,7 @@ use tower_http::trace::TraceLayer;
 
 pub mod auth;
 pub mod dpop;
+pub mod error;
 pub mod login;
 pub mod password;
 pub mod random;
