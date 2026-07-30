@@ -24,7 +24,7 @@ a directory identically regardless of name, so this is pure organization:
 ## Quick path
 
 ```bash
-./deploy.sh v0.8.0
+./deploy.sh v0.9.0
 ```
 
 Builds and pushes the image (with the correct `--platform linux/amd64` —
@@ -59,20 +59,24 @@ Two things force a phased sequence, whether run via `deploy.sh` or by hand:
 cd terraform/production
 terraform init
 
-# 1. Build and push the image first (tag matches the repo's vX.Y.Z convention).
+# 1. Create just the Artifact Registry repo and the empty Secret Manager
+#    container (and everything else that doesn't depend on the image or
+#    Cloud Run existing). The repo has to exist before step 2 can push
+#    into it — on a genuinely first deploy, neither resource exists yet.
+terraform apply \
+  -target=google_artifact_registry_repository.auth_service \
+  -target=google_secret_manager_secret.jwt_signing_secret
+
+# 2. Build and push the image (tag matches the repo's vX.Y.Z convention).
 #    --platform linux/amd64 is required: Cloud Run runs amd64, and a plain
 #    `docker build` on an Apple Silicon laptop would otherwise produce an
 #    arm64 image (or a slow QEMU-emulated one) with no error until deploy.
 gcloud auth configure-docker us-central1-docker.pkg.dev
 cd ../..
 docker build --platform linux/amd64 \
-  -t us-central1-docker.pkg.dev/johnhealio-claude-code/auth-service/auth-service:v0.8.0 .
-docker push us-central1-docker.pkg.dev/johnhealio-claude-code/auth-service/auth-service:v0.8.0
+  -t us-central1-docker.pkg.dev/johnhealio-claude-code/auth-service/auth-service:v0.9.0 .
+docker push us-central1-docker.pkg.dev/johnhealio-claude-code/auth-service/auth-service:v0.9.0
 cd terraform/production
-
-# 2. Create just the empty Secret Manager container (and everything else
-#    that doesn't depend on the secret having a value or Cloud Run existing)
-terraform apply -target=google_secret_manager_secret.jwt_signing_secret
 
 # 3. Populate the secret out-of-band — never via Terraform. Skip this step
 #    on a redeploy: re-adding a version rotates the signing secret and
@@ -83,14 +87,14 @@ openssl rand -hex 32 | gcloud secrets versions add jwt-signing-secret \
 # 4. First full apply — deploys Cloud Run with a placeholder PUBLIC_BASE_URL.
 #    /healthz will work at this point; DPoP-protected endpoints won't yet.
 terraform apply \
-  -var="container_image=us-central1-docker.pkg.dev/johnhealio-claude-code/auth-service/auth-service:v0.8.0"
+  -var="container_image=us-central1-docker.pkg.dev/johnhealio-claude-code/auth-service/auth-service:v0.9.0"
 
 # 5. Read the real URL Cloud Run assigned
 terraform output cloud_run_url
 
 # 6. Re-apply with the real URL, so DPoP htu validation matches reality
 terraform apply \
-  -var="container_image=us-central1-docker.pkg.dev/johnhealio-claude-code/auth-service/auth-service:v0.8.0" \
+  -var="container_image=us-central1-docker.pkg.dev/johnhealio-claude-code/auth-service/auth-service:v0.9.0" \
   -var="public_base_url=<the URL from step 5>"
 ```
 

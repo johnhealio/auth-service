@@ -27,7 +27,7 @@
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
-  echo "Usage: $0 <image-tag, e.g. v0.8.0>" >&2
+  echo "Usage: $0 <image-tag, e.g. v0.9.0>" >&2
   exit 1
 fi
 
@@ -42,13 +42,19 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 cd "${SCRIPT_DIR}"
 terraform init -input=false
 
+# Both created first, before the image is built: the push destination
+# (the Artifact Registry repo) has to exist before `docker push` can
+# target it — pushing first would fail on a genuinely first deploy, when
+# neither this repo nor the secret container exist yet.
+echo "==> Ensuring the Artifact Registry repo and Secret Manager container exist"
+terraform apply \
+  -target=google_artifact_registry_repository.auth_service \
+  -target=google_secret_manager_secret.jwt_signing_secret
+
 echo "==> Building and pushing ${IMAGE}"
 gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
 docker build --platform linux/amd64 -t "${IMAGE}" "${REPO_ROOT}"
 docker push "${IMAGE}"
-
-echo "==> Ensuring the Secret Manager container exists"
-terraform apply -target=google_secret_manager_secret.jwt_signing_secret
 
 if ! gcloud secrets versions list jwt-signing-secret \
     --project="${PROJECT_ID}" --format="value(name)" | grep -q .; then
