@@ -124,22 +124,30 @@ gcloud projects get-iam-policy johnhealio-claude-code \
   --filter="bindings.members:$(terraform output -raw service_account_email)"
 ```
 
-The runtime service account (`iam.tf`) should show exactly four bindings:
+The command above shows only *project-level* bindings — it should return
+exactly three:
 
 - `roles/datastore.user`, with a `condition` restricting it to
   `projects/johnhealio-claude-code/databases/auth-service-prod` — not a
   bare project-wide grant
-- `roles/secretmanager.secretAccessor` (this one is on the secret's own
-  IAM policy, not the project's — check with
-  `gcloud secrets get-iam-policy jwt-signing-secret` instead)
 - `roles/logging.logWriter` and `roles/monitoring.metricWriter`, both
   unconditional project grants — required because this is a custom
   runtime service account rather than the default Compute Engine one,
-  which gets equivalent access implicitly. (Pulling the container image
-  itself doesn't go through this service account at all — that's the
-  Cloud Run Service Agent, which Google auto-grants Artifact Registry
-  read access to for same-project repositories when the Cloud Run API is
-  enabled; nothing to configure here.)
+  which gets equivalent access implicitly.
+
+The runtime service account holds a fourth role, `roles/secretmanager.secretAccessor`,
+but it won't show up above — it's granted on the secret's own IAM policy,
+not the project's, so check it separately:
+
+```bash
+gcloud secrets get-iam-policy jwt-signing-secret --project=johnhealio-claude-code
+```
+
+(Pulling the container image itself doesn't go through this service
+account at all — that's the Cloud Run Service Agent, which Google
+auto-grants Artifact Registry read access to for same-project
+repositories when the Cloud Run API is enabled; nothing to configure
+here.)
 
 ## Redeploying after a code change
 
