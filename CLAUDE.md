@@ -394,6 +394,46 @@ cost/cold-start profile. Public invoker access (`allUsers`) is
 intentional — this is an auth service, registration/login must be
 reachable without pre-existing credentials.
 
+### Module 8 addendum: production Terraform hardened before first real apply
+Done ahead of actually executing the deployment above, prompted by a
+pre-apply IAM/process review rather than a live incident:
+- **IAM gap closed**: the runtime service account only had
+  `secretAccessor` and a database-scoped `datastore.user` — missing
+  `roles/logging.logWriter` and `roles/monitoring.metricWriter`, which
+  Google's own Cloud Run service-identity docs call out as required for
+  any *custom* runtime service account (the default Compute Engine SA
+  gets equivalent access implicitly via a legacy broad grant; a dedicated
+  SA like this one gets nothing until granted explicitly). Both added as
+  unconditional project grants in `iam.tf` — image pulls themselves don't
+  go through this service account at all (that's the Cloud Run Service
+  Agent, auto-granted Artifact Registry read on same-project repos when
+  the Cloud Run API is enabled), so no grant was needed there.
+- **`main.tf` split** into `providers.tf`/`apis.tf`/`iam.tf`/
+  `firestore.tf`/`artifact_registry.tf`/`secrets.tf`/`cloud_run.tf` by
+  concern — pure reorganization, confirmed behavior-identical via
+  `terraform validate` before and after. `iam.tf` in particular now reads
+  as a single complete account of everything the runtime SA can do.
+- **`docker build --platform linux/amd64` added**, in both the README's
+  manual sequence and the new `deploy.sh`. Cloud Run runs amd64; a plain
+  `docker build` from an Apple Silicon laptop would otherwise silently
+  produce an arm64 (or slow QEMU-emulated) image with no error until
+  deploy — this codebase's build instructions never pinned a platform.
+- **`deploy.sh` added**, scripting the phased apply sequence rather than
+  replacing it — the two forced phases (Secret Manager value out-of-band,
+  `PUBLIC_BASE_URL` circular dependency) are inherent to the Cloud
+  Run/Secret Manager design, not a process flaw to engineer away. The
+  script's one real behavior improvement over a literal transcription of
+  the manual steps: it checks Terraform state for an existing deployment
+  and skips the placeholder-URL round-trip on redeploys (a naive
+  always-two-phase script would push a transient broken-`htu` revision on
+  every redeploy, not just the first), and it checks for an existing
+  secret version before adding one (a naive always-populate step would
+  rotate the JWT signing secret — and invalidate every live session — on
+  every redeploy). README.md keeps the full manual walkthrough alongside
+  it; this is a learning project, so the script is offered as a shortcut
+  once the mechanics are understood, not a replacement for understanding
+  them.
+
 ### Module 9: Shared error module, not a `StoreError → Response` mapping
 `src/error.rs` centralizes the JSON error shape (`{"error":..,"message":..}`)
 that `register.rs`/`login.rs`/`refresh.rs` had each independently

@@ -5,8 +5,40 @@ privileges (your laptop, not the Claude Code VM — its own service account
 has no IAM permissions on the project, by design). Requires `gcloud`,
 `docker`, and `terraform` installed locally.
 
-This is **not** a single `terraform apply`. Two things force a phased
-sequence:
+## Files
+
+Split by concern, not one `main.tf` — Terraform merges every `.tf` file in
+a directory identically regardless of name, so this is pure organization:
+
+- `providers.tf` — provider/version config
+- `apis.tf` — project API enablement
+- `iam.tf` — the runtime service account and every role granted to it
+  (Secret Manager access, scoped Firestore access, logging/metrics writers)
+- `firestore.tf` — the production Firestore database
+- `artifact_registry.tf` — the image repository
+- `secrets.tf` — the JWT signing secret container (value populated
+  out-of-band, never in Terraform)
+- `cloud_run.tf` — the Cloud Run service and its public-invoker binding
+- `deploy.sh` — scripts the phased sequence below
+
+## Quick path
+
+```bash
+./deploy.sh v0.8.0
+```
+
+Builds and pushes the image (with the correct `--platform linux/amd64` —
+see the note below), creates the Secret Manager container, populates it
+only if it doesn't already have a value (so a redeploy never rotates the
+live signing secret), and runs one or two `terraform apply`s depending on
+whether this is the first deploy or a redeploy. Every `apply` still stops
+for interactive approval — the script removes manual-step error, not
+review. Read on for what it's doing and why, or if you'd rather run each
+step by hand.
+
+## Why this isn't a single `terraform apply`
+
+Two things force a phased sequence, whether run via `deploy.sh` or by hand:
 
 1. Cloud Run's `JWT_SIGNING_SECRET` env var is sourced from Secret
    Manager's `latest` version, which has to exist before Cloud Run can
@@ -17,17 +49,24 @@ sequence:
    own `https://...run.app` URL, which isn't known until *after* Cloud Run
    creates the service — a real circular dependency, resolved the same way
    as (1): deploy once with a placeholder, then re-apply with the real URL.
+   This round only applies on a genuine first deploy — once the service
+   exists, its URL is already known from state, so a redeploy is a single
+   `apply`.
 
-## Sequence
+## Manual sequence
 
 ```bash
 cd terraform/production
 terraform init
 
-# 1. Build and push the image first (tag matches the repo's vX.Y.Z convention)
+# 1. Build and push the image first (tag matches the repo's vX.Y.Z convention).
+#    --platform linux/amd64 is required: Cloud Run runs amd64, and a plain
+#    `docker build` on an Apple Silicon laptop would otherwise produce an
+#    arm64 image (or a slow QEMU-emulated one) with no error until deploy.
 gcloud auth configure-docker us-central1-docker.pkg.dev
 cd ../..
-docker build -t us-central1-docker.pkg.dev/johnhealio-claude-code/auth-service/auth-service:v0.8.0 .
+docker build --platform linux/amd64 \
+  -t us-central1-docker.pkg.dev/johnhealio-claude-code/auth-service/auth-service:v0.8.0 .
 docker push us-central1-docker.pkg.dev/johnhealio-claude-code/auth-service/auth-service:v0.8.0
 cd terraform/production
 
@@ -35,7 +74,9 @@ cd terraform/production
 #    that doesn't depend on the secret having a value or Cloud Run existing)
 terraform apply -target=google_secret_manager_secret.jwt_signing_secret
 
-# 3. Populate the secret out-of-band — never via Terraform
+# 3. Populate the secret out-of-band — never via Terraform. Skip this step
+#    on a redeploy: re-adding a version rotates the signing secret and
+#    invalidates every live session.
 openssl rand -hex 32 | gcloud secrets versions add jwt-signing-secret \
   --project=johnhealio-claude-code --data-file=-
 
@@ -79,18 +120,36 @@ gcloud projects get-iam-policy johnhealio-claude-code \
   --filter="bindings.members:$(terraform output -raw service_account_email)"
 ```
 
-The `roles/datastore.user` binding should show a `condition` restricting it
-to `projects/johnhealio-claude-code/databases/auth-service-prod` — not a
-bare project-wide grant.
+The runtime service account (`iam.tf`) should show exactly four bindings:
+
+- `roles/datastore.user`, with a `condition` restricting it to
+  `projects/johnhealio-claude-code/databases/auth-service-prod` — not a
+  bare project-wide grant
+- `roles/secretmanager.secretAccessor` (this one is on the secret's own
+  IAM policy, not the project's — check with
+  `gcloud secrets get-iam-policy jwt-signing-secret` instead)
+- `roles/logging.logWriter` and `roles/monitoring.metricWriter`, both
+  unconditional project grants — required because this is a custom
+  runtime service account rather than the default Compute Engine one,
+  which gets equivalent access implicitly. (Pulling the container image
+  itself doesn't go through this service account at all — that's the
+  Cloud Run Service Agent, which Google auto-grants Artifact Registry
+  read access to for same-project repositories when the Cloud Run API is
+  enabled; nothing to configure here.)
 
 ## Redeploying after a code change
 
-Bump the version (`Cargo.toml` + tag, same as every prior module), rebuild
-and push the image with the new tag, then:
+Bump the version (`Cargo.toml` + tag, same as every prior module), then
+either `./deploy.sh vX.Y.Z` or, by hand:
 
 ```bash
+docker build --platform linux/amd64 -t ...:vX.Y.Z .
+docker push ...:vX.Y.Z
 terraform apply -var="container_image=...:vX.Y.Z" -var="public_base_url=<unchanged>"
 ```
 
-`public_base_url` doesn't change between deploys once set correctly — only
-`container_image` does.
+`public_base_url` doesn't change between deploys once set correctly — it's
+a Terraform input variable, not tracked resource state, so it must be
+passed explicitly on every apply or it reverts to `variables.tf`'s
+placeholder default. `deploy.sh` handles this automatically by reading the
+already-deployed URL from state.
